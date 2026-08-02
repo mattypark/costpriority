@@ -17,7 +17,8 @@ local Brain = {}
 
 local CLAUDE = os.getenv("HOME") .. "/.local/bin/claude"
 local PROMPT_FILE = hs.configdir .. "/cost/prompt.md"
-local TIMEOUT = 45
+-- Generous, because it covers the CLI's cold start as well as the request.
+local TIMEOUT = 90
 local MAX_EVENTS = 40      -- a pathological calendar shouldn't blow up the prompt
 
 local DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -187,7 +188,13 @@ function Brain.validate(raw)
     end
   end
 
-  if #priorities == 0 then return nil, "no usable priorities" end
+  -- An empty list is a legitimate answer, not a failure: on a day where
+  -- everything has already happened there is nothing left to rank, and the
+  -- prompt explicitly asks for empty arrays rather than padding. Only treat it
+  -- as malformed when the model offered priorities and every one was unusable.
+  if #priorities == 0 and #raw.priorities > 0 then
+    return nil, "priorities were all malformed"
+  end
 
   table.sort(priorities, function(a, b) return RANK_ORDER[a.rank] < RANK_ORDER[b.rank] end)
 
@@ -294,16 +301,22 @@ function Brain.rank(events, opts, callback)
     return
   end
 
-  -- The events go on stdin, never in argv: argv has a length limit and quoting
-  -- a JSON blob through it is a needless hazard.
-  running:setInput(payload(events))
-
   timeout = hs.timer.doAfter(TIMEOUT, function()
     if running then running:terminate() end
     finish(nil, "claude timed out after " .. TIMEOUT .. "s")
   end)
 
   running:start()
+
+  -- The events go on stdin, never in argv: argv has a length limit and quoting
+  -- a JSON blob through it is a needless hazard.
+  --
+  -- closeInput() is not optional. `claude -p` reads stdin until EOF, so leaving
+  -- the pipe open makes it wait for input that will never arrive — it hangs
+  -- until the timeout above fires, every single time, and the board silently
+  -- falls back to the offline ranker.
+  running:setInput(payload(events))
+  running:closeInput()
 end
 
 return Brain
