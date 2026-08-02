@@ -1,0 +1,11 @@
+.DS_Store
+*.bak
+*.bak.*
+
+# Built by helper/CostCalendar/build.sh — never committed, since the ad-hoc
+# code signature (and therefore the calendar permission grant) is per-machine.
+helper/CostCalendar/build/
+helper/CostCalendar/*.app/
+
+# Local cache of each day's ranked priorities.
+.cost/

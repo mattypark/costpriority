@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "name": "cost",
+  "label": "Cost",
+  "module": "cost",
+  "version": "0.1.0",
+  "icon": "assets/pet.png",
+  "hotkey": "⌃⌥⌘I",
+  "blurb": "Today's top priorities, P0 through P3."
+}
