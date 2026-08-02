@@ -79,10 +79,40 @@ whether the title reads consequential (`interview`, `deadline`, `exam`, `flight`
 or skippable (`optional`, `tentative`, `hold`). Ties break on start time then
 title, so the same day always ranks the same way.
 
-**`claude -p`** *(coming)* — the same events handed to Claude Code running
-headless on your existing subscription, for ranking that understands what the
-events mean. Falls back to the deterministic ranker whenever it's missing, slow,
-or returns something that isn't the agreed shape.
+**`claude -p`** (default when the CLI is installed) — the same events handed to
+Claude Code running headless on your existing subscription, so the ranking
+understands what the events actually mean rather than matching keywords. It
+falls back to the deterministic ranker whenever the CLI is missing, slow, or
+returns something that isn't the agreed shape, and the board always says which
+engine produced what you're looking at — a blunt ranking that looks identical to
+a considered one is worse than one that admits it.
+
+Toggle it from the pet's menu.
+
+### Cost
+
+A bare `claude -p` loads your `CLAUDE.md`, skills and plugins into context —
+measured at ~83k tokens and **$0.69 per call** on a normal setup. None of that
+helps rank a calendar, so the invocation strips all of it:
+
+```
+--setting-sources ""  --tools ""  --strict-mcp-config  --system-prompt "…"
+--model claude-haiku-4-5-20251001
+```
+
+That brings a refresh to roughly **$0.005–$0.05**, depending on how full the day
+is. Results are cached per day in `~/.cost/cache/`, so a reload, a reboot, or a
+second click costs nothing — only the first ranking of each day pays.
+
+### When it refreshes
+
+Once each morning at 07:00, on wake or unlock if the day isn't ranked yet, and
+whenever you ask. The wake watcher matters more than the timer: `hs.timer.doAt`
+silently skips when the Mac is asleep at the appointed moment, which for a 7am
+job is the normal case rather than the exception.
+
+The prompt lives at `~/.hammerspoon/cost/prompt.md` and is read fresh every
+refresh — edit it and the next ranking uses your wording, no reload needed.
 
 ## Your own sprite
 

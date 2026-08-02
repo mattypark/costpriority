@@ -34,6 +34,7 @@ mkdir -p "$HS_DIR/cost/assets" "$HS_DIR/cost/sources"
 cp "$REPO"/hammerspoon/cost/*.lua          "$HS_DIR/cost/"
 cp "$REPO"/hammerspoon/cost/sources/*.lua  "$HS_DIR/cost/sources/"
 cp "$REPO"/hammerspoon/cost/pet.json       "$HS_DIR/cost/"
+cp "$REPO"/hammerspoon/cost/prompt.md      "$HS_DIR/cost/"
 cp "$REPO"/hammerspoon/cost/assets/README.txt "$HS_DIR/cost/assets/"
 
 # Never clobber a sprite you chose yourself.

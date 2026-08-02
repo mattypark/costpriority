@@ -12,6 +12,8 @@ local Pet      = require("cost.pet")
 local Board    = require("cost.board")
 local Menu     = require("cost.menu")
 local Ranker   = require("cost.ranker")
+local Brain    = require("cost.brain")
+local Cache    = require("cost.cache")
 local Calendar = require("cost.sources.calendar")
 local Fake     = require("cost.sources.fake")
 local themes   = require("cost.themes")
@@ -20,8 +22,9 @@ local M = {}
 
 local HOTKEY = { { "ctrl", "alt", "cmd" }, "i" }
 local HOTKEY_HINT = "⌃⌥⌘I"
+local MORNING = "07:00"
 
-local state, pet, board, menu, menubar, hotkey
+local state, pet, board, menu, menubar, hotkey, morningTimer, waker
 local data                     -- the last ranking we drew
 local generatedAt              -- epoch seconds of that ranking
 local fetching = false         -- a refresh is in flight; clicks shouldn't stack
@@ -41,17 +44,22 @@ local function isStale()
   return (os.time() - generatedAt) > (4 * 3600)
 end
 
---- Draw a finished ranking.
+--- Draw a finished ranking, and remember it for the rest of the day.
 local function present(ranked, opts)
+  opts = opts or {}
+
   data = ranked
-  generatedAt = os.time()
+  generatedAt = ranked.generatedAt or os.time()
+  ranked.generatedAt = generatedAt
 
   pet:setBusy(false)
+
+  if not opts.fromCache then Cache.write(ranked) end
 
   if opts.open then
     board:setAnchor(pet:frame())
     board:show(data)
-    pet:nudge()
+    if not opts.quiet then pet:nudge() end
   else
     board:update(data)
   end
@@ -59,37 +67,78 @@ local function present(ranked, opts)
   return data
 end
 
+--- Which engine produced this, said plainly on the board. Silent degradation is
+--- the failure mode worth designing against here: an offline ranking that looks
+--- identical to a considered one is worse than an obviously blunt one.
+local function note(engine, events, detail)
+  local count = #events .. (#events == 1 and " event" or " events") .. " today"
+  if engine == "ai" then return "Ranked by Claude · " .. count end
+  if detail then return "Offline ranking · " .. detail end
+  return "Offline ranking · " .. count
+end
+
 --- Fetch today's events, rank them, draw the board.
 ---
---- Every failure path still produces a board: an empty one with the reason on
---- it beats a click that appears to do nothing.
+--- calendar -> claude -> deterministic ranker, each falling through to the next.
+--- Every failure path still produces a board: an empty one carrying the reason
+--- beats a click that appears to do nothing.
 function M.refresh(opts)
   opts = opts or {}
 
   if fetching then return end
   fetching = true
-
   pet:setBusy(true)
 
-  Calendar.fetch(function(events, err)
-    fetching = false
+  local function offline(events, detail)
+    local ranked = Ranker.rank(events)
+    ranked.heading = os.date("%A %d %B")
+    ranked.note = note("offline", events, detail)
+    ranked.engine = "offline"
+    present(ranked, opts)
+  end
 
+  Calendar.fetch(function(events, err)
     if err then
-      -- Fall back to the sample day rather than showing nothing, and say so
-      -- plainly on the board so it can't be mistaken for real events.
+      fetching = false
+      -- Sample data rather than a blank board, labelled so it cannot be
+      -- mistaken for the real day.
       local ranked = Ranker.rank(Fake.events())
       ranked.heading = os.date("%A %d %B") .. "  ·  sample data"
       ranked.note = "Couldn't read the calendar — " .. err
+      ranked.engine = "sample"
       present(ranked, opts)
       return
     end
 
-    local ranked = Ranker.rank(events)
-    ranked.heading = os.date("%A %d %B")
-    ranked.note = "Offline ranking · " .. #events .. " events today"
-    ranked.empty = "Nothing on the calendar today."
-    present(ranked, opts)
+    if not state.useAI or not Brain.available() or #events == 0 then
+      fetching = false
+      offline(events, not Brain.available() and "claude CLI not found" or nil)
+      return
+    end
+
+    Brain.rank(events, { model = state.model }, function(ranked, brainErr)
+      fetching = false
+
+      if not ranked then
+        offline(events, brainErr)
+        return
+      end
+
+      ranked.heading = os.date("%A %d %B")
+      ranked.note = note("ai", events)
+      ranked.engine = "ai"
+      ranked.empty = "Nothing left on the calendar today."
+      present(ranked, opts)
+    end)
   end)
+end
+
+--- Refresh only if what we hold is stale. The morning timer and the wake
+--- watcher both come through here, so neither re-ranks a day that is already
+--- ranked.
+function M.refreshIfStale(opts)
+  if not isStale() then return end
+  M.refresh(opts)
 end
 
 --- Click behaviour: toggle the board, and refresh on the way if what we're
@@ -216,6 +265,24 @@ function actions()
   }
 
   rows[#rows + 1] = { kind = "sep" }
+
+  local brainReady = Brain.available()
+  rows[#rows + 1] = {
+    title = state.useAI and "Ranked by Claude" or "Offline ranking",
+    hint = brainReady and (state.useAI and "on" or "off") or "no CLI",
+    preview = brainReady
+      and (state.useAI and "~$0.005 a refresh · falls back if it fails"
+                       or "keyword scoring only, instant and free")
+      or "install the claude CLI to enable",
+    fn = function()
+      if not brainReady then return end
+      state.useAI = not state.useAI
+      State.save(state)
+      M.refresh({ open = true })
+    end,
+  }
+
+  rows[#rows + 1] = { kind = "sep" }
   rows[#rows + 1] = { title = "Theme", hint = "▸ " .. themes.label(), submenu = themePage }
   rows[#rows + 1] = { title = "Pet size", hint = "▸ " .. state.petWidth, submenu = sizePage }
   rows[#rows + 1] = {
@@ -300,6 +367,10 @@ function M.debug()
     boardOpen = board and board:isOpen(),
     generatedAt = generatedAt and os.date("%Y-%m-%d %H:%M", generatedAt) or nil,
     stale = isStale(),
+    engine = data and data.engine or nil,
+    useAI = state.useAI,
+    claude = Brain.executable() or "not found",
+    helper = require("cost.sources.calendar").available(),
     priorities = data and #(data.priorities or {}) or 0,
     rest = data and #(data.rest or {}) or 0,
     position = pet and { x = pet.baseX, y = pet.baseY } or nil,
@@ -345,6 +416,30 @@ local function start()
 
   hotkey = hs.hotkey.bind(HOTKEY[1], HOTKEY[2], function() M.toggle() end)
 
+  -- Today's ranking, if it was already worked out. Costs nothing and means a
+  -- reload never re-ranks a day that's already ranked.
+  Cache.prune()
+  local cached = Cache.read()
+  if cached and cached.priorities then
+    data = cached
+    generatedAt = cached.generatedAt
+  end
+
+  -- The morning briefing. doAt alone is not enough: it silently skips when the
+  -- Mac is asleep at the appointed time, which for a 7am job is the normal case
+  -- rather than the exception. The wake watcher is what actually makes this
+  -- fire most mornings.
+  morningTimer = hs.timer.doAt(MORNING, "1d", function() M.refreshIfStale() end)
+
+  waker = hs.caffeinate.watcher.new(function(event)
+    if event == hs.caffeinate.watcher.systemDidWake
+       or event == hs.caffeinate.watcher.screensDidUnlock then
+      -- Let the network and calendar sync settle before asking.
+      hs.timer.doAfter(6, function() M.refreshIfStale() end)
+    end
+  end)
+  waker:start()
+
   -- Register with the pet bus so a manager can hide or quit every pet at once.
   _G.PETS = _G.PETS or {}
   _G.PETS.cost = {
@@ -370,6 +465,8 @@ local function start()
       if pet then pet:delete(); pet = nil end
       if menubar then menubar:delete(); menubar = nil end
       if hotkey then hotkey:delete(); hotkey = nil end
+      if morningTimer then morningTimer:stop(); morningTimer = nil end
+      if waker then waker:stop(); waker = nil end
     end,
   }
 end
