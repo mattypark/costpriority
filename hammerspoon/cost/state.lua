@@ -12,12 +12,12 @@ local defaults = {
   theme     = "claude",
   petWidth  = 96,
   boardOpen = false,
+  scope     = "daily",   -- which list the board is showing
   model     = "",        -- empty = whatever `claude` defaults to
-  useAI     = true,      -- off falls back to the deterministic ranker
 }
 
 local KEYS = {
-  "x", "y", "hidden", "theme", "petWidth", "boardOpen", "model", "useAI", "configured",
+  "x", "y", "hidden", "theme", "petWidth", "boardOpen", "scope", "model", "configured",
 }
 
 local State = {}

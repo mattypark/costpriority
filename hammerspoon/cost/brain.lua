@@ -17,6 +17,7 @@ local Brain = {}
 
 local CLAUDE = os.getenv("HOME") .. "/.local/bin/claude"
 local PROMPT_FILE = hs.configdir .. "/cost/prompt.md"
+local PRIORITIES_PROMPT = hs.configdir .. "/cost/prompt-priorities.md"
 -- Generous, because it covers the CLI's cold start as well as the request.
 local TIMEOUT = 90
 local MAX_EVENTS = 40      -- a pathological calendar shouldn't blow up the prompt
@@ -55,8 +56,8 @@ end
 
 --- Everything after the first `---` on its own line. Lets the file carry notes
 --- about itself without those notes reaching the model.
-local function loadPrompt()
-  local file = io.open(PROMPT_FILE, "r")
+local function loadPrompt(path)
+  local file = io.open(path or PROMPT_FILE, "r")
   if not file then return nil end
 
   local raw = file:read("*a")
@@ -220,14 +221,44 @@ function Brain.validate(raw)
   return { priorities = priorities, rest = rest }
 end
 
+--- Validate a priority-list ranking into { [id] = "P0", ... }.
+---
+--- Unknown ids are dropped rather than trusted: the model occasionally invents
+--- one, and applying a rank to an item that doesn't exist would silently lose
+--- the ranking for the item that does.
+function Brain.validateRanking(raw)
+  if type(raw) ~= "table" then return nil, "not an object" end
+
+  local list = raw.ranking
+  if type(list) ~= "table" then return nil, "no ranking array" end
+
+  local ranking, why, seen = {}, {}, {}
+
+  for _, entry in ipairs(list) do
+    if type(entry) == "table" and type(entry.id) == "string" then
+      local rank = type(entry.rank) == "string" and entry.rank:upper() or nil
+      if rank and RANK_ORDER[rank] and not seen[rank] and not ranking[entry.id] then
+        seen[rank] = true
+        ranking[entry.id] = rank
+        why[entry.id] = clean(entry.why, 80)
+      end
+    end
+  end
+
+  return { ranking = ranking, why = why }
+end
+
 -- ----------------------------------------------------------------------- run
 
---- @param events table    today's events
---- @param opts table|nil  { model = "..." }
---- @param callback function(ranked, err)
-function Brain.rank(events, opts, callback)
-  opts = opts or {}
-
+--- The shared path: run claude with a prompt and a JSON payload, hand the raw
+--- decoded object to `shape` for validation.
+---
+--- @param prompt string          the user prompt
+--- @param input string           JSON for stdin
+--- @param opts table             { model = "..." }
+--- @param shape function(raw)    returns (value, err)
+--- @param callback function(value, err)
+local function run(prompt, input, opts, shape, callback)
   local executable = Brain.executable()
   if not executable then
     callback(nil, "claude CLI not found")
@@ -236,17 +267,6 @@ function Brain.rank(events, opts, callback)
 
   if running then
     callback(nil, "already thinking")
-    return
-  end
-
-  local prompt = loadPrompt()
-  if not prompt then
-    callback(nil, "prompt.md is missing")
-    return
-  end
-
-  if not events or #events == 0 then
-    callback(nil, "nothing to rank")
     return
   end
 
@@ -276,13 +296,13 @@ function Brain.rank(events, opts, callback)
       return
     end
 
-    local ranked, invalid = Brain.validate(raw)
-    if not ranked then
+    local value, invalid = shape(raw)
+    if not value then
       finish(nil, invalid)
       return
     end
 
-    finish(ranked)
+    finish(value)
   end, {
     "-p",
     "--output-format", "json",
@@ -308,15 +328,73 @@ function Brain.rank(events, opts, callback)
 
   running:start()
 
-  -- The events go on stdin, never in argv: argv has a length limit and quoting
-  -- a JSON blob through it is a needless hazard.
+  -- The payload goes on stdin, never in argv: argv has a length limit and
+  -- quoting a JSON blob through it is a needless hazard.
   --
   -- closeInput() is not optional. `claude -p` reads stdin until EOF, so leaving
   -- the pipe open makes it wait for input that will never arrive — it hangs
   -- until the timeout above fires, every single time, and the board silently
   -- falls back to the offline ranker.
-  running:setInput(payload(events))
+  running:setInput(input)
   running:closeInput()
+end
+
+-- ------------------------------------------------------------- public calls
+
+--- Rank today's calendar events.
+function Brain.rank(events, opts, callback)
+  opts = opts or {}
+
+  local prompt = loadPrompt(PROMPT_FILE)
+  if not prompt then return callback(nil, "prompt.md is missing") end
+  if not events or #events == 0 then return callback(nil, "nothing to rank") end
+
+  run(prompt, payload(events), opts, Brain.validate, callback)
+end
+
+--- Rank the user's own list, with the calendar as context.
+--- @return table  { [itemId] = "P0", ... }
+function Brain.rankPriorities(items, events, scope, opts, callback)
+  opts = opts or {}
+
+  local prompt = loadPrompt(PRIORITIES_PROMPT)
+  if not prompt then return callback(nil, "prompt-priorities.md is missing") end
+
+  local open = {}
+  for _, item in ipairs(items or {}) do
+    if not item.done then
+      open[#open + 1] = {
+        id = item.id,
+        text = item.text,
+        pinned = item.pinned,
+        added = item.created and os.date("%Y-%m-%d", item.created) or nil,
+      }
+    end
+  end
+
+  if #open == 0 then return callback(nil, "nothing to rank") end
+
+  local context = {}
+  for index, event in ipairs(events or {}) do
+    if index > 25 then break end
+    context[#context + 1] = {
+      title = event.title,
+      start = event.start,
+      endTime = event.endTime,
+      allDay = event.allDay and true or false,
+    }
+  end
+
+  local input = hs.json.encode({
+    now = os.time(),
+    now_local = os.date("%Y-%m-%d %H:%M"),
+    weekday = os.date("%A"),
+    scope = scope,
+    items = open,
+    calendar = context,
+  })
+
+  run(prompt, input, opts, Brain.validateRanking, callback)
 end
 
 return Brain

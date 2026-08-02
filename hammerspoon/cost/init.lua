@@ -1,173 +1,259 @@
---- cost — a desktop pet that tells you today's top priorities.
+--- cost — a desktop pet that holds what you decided actually matters.
 ---
---- Click him and a board appears: P0 through P3, then everything else. The
---- ranking comes from your calendar, ordered either by `claude -p` or, when that
---- is unavailable, by a deterministic ranker that always answers.
+--- Priorities are things you tell it, kept in three independent lists: daily,
+--- weekly, monthly. Your calendar is context around them, not the content —
+--- it's always shown, but it never becomes a priority on its own.
 ---
---- Phase 1: sprite, board, themes and the pet bus, driven by sample events. No
---- macOS permission is required to run any of this.
+--- Nothing calls Claude on its own. Ranking happens when you ask for it.
 
-local State    = require("cost.state")
-local Pet      = require("cost.pet")
-local Board    = require("cost.board")
-local Menu     = require("cost.menu")
-local Ranker   = require("cost.ranker")
-local Brain    = require("cost.brain")
-local Cache    = require("cost.cache")
-local Calendar = require("cost.sources.calendar")
-local Fake     = require("cost.sources.fake")
-local themes   = require("cost.themes")
+local State      = require("cost.state")
+local Pet        = require("cost.pet")
+local Board      = require("cost.board")
+local Menu       = require("cost.menu")
+local Priorities = require("cost.priorities")
+local Brain      = require("cost.brain")
+local Calendar   = require("cost.sources.calendar")
+local themes     = require("cost.themes")
 
 local M = {}
 
 local HOTKEY = { { "ctrl", "alt", "cmd" }, "i" }
 local HOTKEY_HINT = "⌃⌥⌘I"
-local MORNING = "07:00"
 
-local state, pet, board, menu, menubar, hotkey, morningTimer, waker
-local data                     -- the last ranking we drew
-local generatedAt              -- epoch seconds of that ranking
-local fetching = false         -- a refresh is in flight; clicks shouldn't stack
+local state, pet, board, menu, menubar, hotkey, waker
+local lists                    -- the three priority lists
+local events = {}              -- today's calendar, for context
+local calendarNote             -- why the calendar is missing, when it is
+local busy = false             -- a Claude call is in flight
 
--- ------------------------------------------------------------------ ranking
+-- ------------------------------------------------------------------- helpers
 
-local function today()
-  return os.date("%Y-%m-%d")
+local function scope()
+  return state.scope or "daily"
 end
 
---- Stale once the day rolls over, or after four hours — long enough that the
---- morning briefing survives a lunch break, short enough that an afternoon
---- click doesn't show you this morning's plan.
-local function isStale()
-  if not data or not generatedAt then return true end
-  if os.date("%Y-%m-%d", generatedAt) ~= today() then return true end
-  return (os.time() - generatedAt) > (4 * 3600)
+--- "in 2h", "12:30", "all day" — short enough for the right-hand column.
+local function eventNote(event, now)
+  if event.allDay then return "all day" end
+  if not event.start then return "" end
+
+  if event.endTime and event.endTime <= now then return "done" end
+  if event.start <= now then return "now" end
+  return os.date("%H:%M", event.start)
 end
 
---- Draw a finished ranking, and remember it for the rest of the day.
-local function present(ranked, opts)
-  opts = opts or {}
+-- --------------------------------------------------------------------- board
 
-  data = ranked
-  generatedAt = ranked.generatedAt or os.time()
-  ranked.generatedAt = generatedAt
+--- Everything the board draws, assembled from the three sources: the current
+--- list, the calendar, and whatever Claude last said.
+local function compose()
+  local ranked, rest, done = Priorities.view(lists, scope())
 
-  pet:setBusy(false)
+  local priorities = {}
+  for _, item in ipairs(ranked) do
+    priorities[#priorities + 1] = {
+      rank = item.rank,
+      title = item.text,
+      why = item.why,
+      when = item.pinned and "pinned" or nil,
+      id = item.id,
+    }
+  end
 
-  if not opts.fromCache then Cache.write(ranked) end
+  local restRows = {}
+  for _, item in ipairs(rest) do
+    restRows[#restRows + 1] = { title = item.text, id = item.id }
+  end
 
-  if opts.open then
-    board:setAnchor(pet:frame())
-    board:show(data)
-    if not opts.quiet then pet:nudge() end
+  local doneRows = {}
+  for _, item in ipairs(done) do
+    doneRows[#doneRows + 1] = { title = item.text, id = item.id }
+  end
+
+  -- The calendar is always shown, whatever state it's in. A board that says
+  -- nothing about the day is worse than one that says the day is over.
+  local now = os.time()
+  local calendarRows = {}
+  for _, event in ipairs(events) do
+    calendarRows[#calendarRows + 1] = {
+      title = event.title or "Untitled",
+      why = eventNote(event, now),
+      calendarEvent = true,
+    }
+  end
+
+  local scopes = {}
+  for _, id in ipairs(Priorities.scopes) do
+    scopes[#scopes + 1] = {
+      id = id,
+      label = Priorities.label[id],
+      count = Priorities.count(lists, id),
+    }
+  end
+
+  local note
+  if busy then
+    note = "Thinking…"
+  elseif calendarNote then
+    note = calendarNote
+  elseif lists.rankedAt and lists.rankedAt[scope()] then
+    note = "Ranked by Claude at " .. os.date("%H:%M", lists.rankedAt[scope()])
   else
-    board:update(data)
+    note = "Not ranked yet — click ↻ or add something"
   end
 
-  return data
-end
-
---- Which engine produced this, said plainly on the board. Silent degradation is
---- the failure mode worth designing against here: an offline ranking that looks
---- identical to a considered one is worse than an obviously blunt one.
-local function note(engine, events, detail)
-  local count = #events .. (#events == 1 and " event" or " events") .. " today"
-  if engine == "ai" then return "Ranked by Claude · " .. count end
-  if detail then return "Offline ranking · " .. detail end
-  return "Offline ranking · " .. count
-end
-
---- Fetch today's events, rank them, draw the board.
----
---- calendar -> claude -> deterministic ranker, each falling through to the next.
---- Every failure path still produces a board: an empty one carrying the reason
---- beats a click that appears to do nothing.
-function M.refresh(opts)
-  opts = opts or {}
-
-  if fetching then return end
-  fetching = true
-  pet:setBusy(true)
-
-  local function offline(events, detail)
-    local ranked = Ranker.rank(events)
-    ranked.heading = os.date("%A %d %B")
-    ranked.note = note("offline", events, detail)
-    ranked.engine = "offline"
-    present(ranked, opts)
+  local empty = "Nothing on your " .. Priorities.label[scope()]:lower() .. " list."
+  if #restRows > 0 or #doneRows > 0 then
+    empty = "Nothing ranked yet — press ↻."
   end
 
-  Calendar.fetch(function(events, err)
+  return {
+    scope = scope(),
+    scopes = scopes,
+    priorities = priorities,
+    rest = restRows,
+    restTitle = "NOT RANKED",
+    done = doneRows,
+    calendar = calendarRows,
+    calendarTitle = "TODAY'S CALENDAR" ..
+                    (#calendarRows == 0 and " — nothing scheduled" or ""),
+    empty = empty,
+    note = note,
+  }
+end
+
+--- Redraw in place if the board is open. Every mutation ends here.
+local function redraw()
+  if board and board:isOpen() then
+    board:setAnchor(pet:frame())
+    board:show(compose())
+  end
+end
+
+local function persist()
+  Priorities.save(lists)
+  State.save(state)
+end
+
+-- ------------------------------------------------------------------ calendar
+
+--- Refresh the calendar only. Never calls Claude, so this is free and safe to
+--- run in the background.
+function M.refreshCalendar(callback)
+  Calendar.fetch(function(fetched, err)
     if err then
-      fetching = false
-      -- Sample data rather than a blank board, labelled so it cannot be
-      -- mistaken for the real day.
-      local ranked = Ranker.rank(Fake.events())
-      ranked.heading = os.date("%A %d %B") .. "  ·  sample data"
-      ranked.note = "Couldn't read the calendar — " .. err
-      ranked.engine = "sample"
-      present(ranked, opts)
-      return
+      calendarNote = "Calendar unavailable — " .. err
+      events = {}
+    else
+      calendarNote = nil
+      events = fetched or {}
     end
-
-    if not state.useAI or not Brain.available() or #events == 0 then
-      fetching = false
-      offline(events, not Brain.available() and "claude CLI not found" or nil)
-      return
-    end
-
-    Brain.rank(events, { model = state.model }, function(ranked, brainErr)
-      fetching = false
-
-      if not ranked then
-        offline(events, brainErr)
-        return
-      end
-
-      ranked.heading = os.date("%A %d %B")
-      ranked.note = note("ai", events)
-      ranked.engine = "ai"
-      ranked.empty = "Nothing left on the calendar today."
-      present(ranked, opts)
-    end)
+    redraw()
+    if callback then callback() end
   end)
 end
 
---- Refresh only if what we hold is stale. The morning timer and the wake
---- watcher both come through here, so neither re-ranks a day that is already
---- ranked.
-function M.refreshIfStale(opts)
-  if not isStale() then return end
-  M.refresh(opts)
-end
+-- ------------------------------------------------------------------- ranking
 
---- Click behaviour: toggle the board, and refresh on the way if what we're
---- holding is stale. A plain click on fresh data costs nothing.
-function M.toggleBoard()
-  if board:isOpen() then
-    board:hide()
-    state.boardOpen = false
-    State.save(state)
+--- Ask Claude to order the current list. Only ever runs because you asked.
+function M.rank()
+  if busy then return end
+
+  local list = lists[scope()] or {}
+  if #list == 0 then
+    redraw()
     return
   end
 
-  if isStale() then
-    M.refresh({ open = true })
-  else
-    board:setAnchor(pet:frame())
-    board:show(data)
+  busy = true
+  pet:setBusy(true)
+  redraw()
+
+  local function done(message)
+    busy = false
+    pet:setBusy(false)
+    calendarNote = message
+    redraw()
   end
 
-  state.boardOpen = true
+  -- Fresh calendar first: ranking against yesterday's context is worse than not
+  -- ranking at all.
+  M.refreshCalendar(function()
+    Brain.rankPriorities(list, events, scope(), { model = state.model },
+      function(result, err)
+        if not result then
+          done("Couldn't rank — " .. tostring(err))
+          return
+        end
+
+        Priorities.applyRanking(lists, scope(), result.ranking)
+
+        for id, why in pairs(result.why or {}) do
+          local item = Priorities.find(lists, id)
+          if item then item.why = why end
+        end
+
+        persist()
+        done(nil)
+      end)
+  end)
+end
+
+-- ----------------------------------------------------------------- mutations
+
+function M.addPriority(text, targetScope)
+  local item = Priorities.add(lists, targetScope or scope(), text)
+  if not item then return nil end
+
+  persist()
+  redraw()
+  return item
+end
+
+function M.setScope(id)
+  if not Priorities.label[id] then return end
+  state.scope = id
   State.save(state)
+  redraw()
+end
+
+--- Clicking an item toggles it done. Direct, reversible, and the thing you want
+--- ninety percent of the time.
+function M.onRow(row)
+  if not row or not row.id then return end
+  Priorities.toggleDone(lists, row.id)
+  persist()
+  redraw()
+end
+
+-- --------------------------------------------------------------------- input
+
+--- Ask for text. A native prompt for now — the themed input bar replaces this,
+--- and is the thing that makes dictation work.
+local function ask(title, message)
+  local button, text = hs.dialog.textPrompt(title, message, "", "Add", "Cancel")
+  if button ~= "Add" then return nil end
+  return text
+end
+
+function M.promptAdd(targetScope)
+  targetScope = targetScope or scope()
+  local text = ask("Add to your " .. Priorities.label[targetScope]:lower() .. " list",
+                   "One priority. You can add more after.")
+  if not text or text == "" then return end
+
+  M.addPriority(text, targetScope)
+
+  if not board:isOpen() then
+    board:setAnchor(pet:frame())
+    board:show(compose())
+  end
 end
 
 -- --------------------------------------------------------------------- menu
 
-local actions   -- forward declaration; submenu pages reference each other
+local actions
 
---- The theme page. Rows stay open when clicked so you can flick through the
---- palettes and watch the board change under the menu.
 local function themePage()
   local rows = { { kind = "header", title = "THEME" } }
 
@@ -184,9 +270,8 @@ local function themePage()
       fn = function()
         state.theme = themes.set(id)
         State.save(state)
-        pet:reskin()                 -- a theme may ship its own sprite
-        board:setAnchor(pet:frame())
-        if board:isOpen() then board:show(data) end
+        pet:reskin()
+        redraw()
       end,
     }
   end
@@ -210,7 +295,7 @@ local function sizePage()
         state.petWidth = width
         State.save(state)
         pet:reskin()
-        board:setAnchor(pet:frame())
+        redraw()
       end,
     }
   end
@@ -220,67 +305,106 @@ local function sizePage()
   return rows
 end
 
---- Copy a chosen PNG into assets/ so swapping the sprite never means a trip to
---- the Finder. Reads as the pet's own drawing from then on.
-function M.chooseSprite()
-  local picked = hs.dialog.chooseFileOrFolder(
-    "Pick a PNG for your pet", os.getenv("HOME"), true, false, false, { "png" })
-  if not picked or not picked["1"] then return end
+--- Pin, unpin or delete one item.
+local function itemPage(item)
+  local rows = { { kind = "header", title = string.upper(item.text:sub(1, 30)) } }
 
-  local source = picked["1"]
-  local target = hs.configdir .. "/cost/assets/pet.png"
-
-  local input = io.open(source, "rb")
-  if not input then
-    hs.alert.show("cost: couldn't read " .. source)
-    return
+  for _, rank in ipairs(Priorities.ranks) do
+    local active = (item.pinned == rank)
+    rows[#rows + 1] = {
+      title = (active and "● " or "   ") .. "Pin to " .. rank,
+      hint = active and "pinned" or nil,
+      fn = function()
+        Priorities.pin(lists, item.id, rank)
+        persist()
+        redraw()
+      end,
+    }
   end
-  local bytes = input:read("*a")
-  input:close()
 
-  local output = io.open(target, "wb")
-  if not output then
-    hs.alert.show("cost: couldn't write " .. target)
-    return
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = {
+    title = item.done and "Mark not done" or "Mark done",
+    fn = function()
+      Priorities.toggleDone(lists, item.id)
+      persist()
+      redraw()
+    end,
+  }
+  rows[#rows + 1] = {
+    title = "Delete",
+    fn = function()
+      Priorities.remove(lists, item.id)
+      persist()
+      redraw()
+    end,
+  }
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = { title = "← Back", submenu = function() return actions() end }
+  return rows
+end
+
+local function itemsPage()
+  local rows = { { kind = "header", title = "EDIT AN ITEM" } }
+
+  for _, item in ipairs(lists[scope()] or {}) do
+    rows[#rows + 1] = {
+      title = (item.done and "✓ " or "   ") .. item.text,
+      hint = item.pinned or item.rank or nil,
+      submenu = function() return itemPage(item) end,
+    }
   end
-  output:write(bytes)
-  output:close()
 
-  pet:reskin()
-  board:setAnchor(pet:frame())
-  hs.alert.show("cost: new sprite in place")
+  if #(lists[scope()] or {}) == 0 then
+    rows[#rows + 1] = { title = "Nothing here yet", hint = nil }
+  end
+
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = { title = "← Back", submenu = function() return actions() end }
+  return rows
 end
 
 function actions()
   local rows = {}
 
   rows[#rows + 1] = {
-    title = board:isOpen() and "Close board" or "Show board",
-    fn = function() M.toggleBoard() end,
+    title = "Add a priority…",
+    hint = Priorities.label[scope()],
+    fn = function() M.promptAdd() end,
   }
   rows[#rows + 1] = {
-    title = "Refresh now",
-    hint = generatedAt and os.date("%H:%M", generatedAt) or nil,
-    fn = function() M.refresh({ open = true }) end,
+    title = "Rank with Claude",
+    hint = Brain.available() and "↻" or "no CLI",
+    preview = "orders this list, using your calendar as context",
+    fn = function() if Brain.available() then M.rank() end end,
+  }
+  rows[#rows + 1] = {
+    title = board:isOpen() and "Close board" or "Show board",
+    fn = function() M.toggleBoard() end,
   }
 
   rows[#rows + 1] = { kind = "sep" }
 
-  local brainReady = Brain.available()
+  for _, id in ipairs(Priorities.scopes) do
+    local active = (scope() == id)
+    rows[#rows + 1] = {
+      title = (active and "● " or "   ") .. Priorities.label[id],
+      hint = Priorities.count(lists, id) > 0 and tostring(Priorities.count(lists, id)) or nil,
+      fn = function() M.setScope(id) end,
+    }
+  end
+
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = { title = "Edit an item", submenu = itemsPage }
   rows[#rows + 1] = {
-    title = state.useAI and "Ranked by Claude" or "Offline ranking",
-    hint = brainReady and (state.useAI and "on" or "off") or "no CLI",
-    preview = brainReady
-      and (state.useAI and "~$0.005 a refresh · falls back if it fails"
-                       or "keyword scoring only, instant and free")
-      or "install the claude CLI to enable",
+    title = "Clear completed",
     fn = function()
-      if not brainReady then return end
-      state.useAI = not state.useAI
-      State.save(state)
-      M.refresh({ open = true })
+      Priorities.clearDone(lists, scope())
+      persist()
+      redraw()
     end,
   }
+  rows[#rows + 1] = { title = "Refresh calendar", fn = function() M.refreshCalendar() end }
 
   rows[#rows + 1] = { kind = "sep" }
   rows[#rows + 1] = { title = "Theme", hint = "▸ " .. themes.label(), submenu = themePage }
@@ -306,17 +430,14 @@ function M.showMenu()
   menu:show(actions(), hs.mouse.absolutePosition())
 end
 
---- The menu bar item needs AppKit's menu, so map the same rows onto it.
 local function nativeMenu()
   local items = {}
 
   for _, row in ipairs(actions()) do
     if row.kind == "sep" then
       items[#items + 1] = { title = "-" }
-
     elseif row.kind == "header" then
       items[#items + 1] = { title = row.title, disabled = true }
-
     elseif row.submenu then
       local nested = {}
       for _, child in ipairs(row.submenu()) do
@@ -328,7 +449,6 @@ local function nativeMenu()
         end
       end
       items[#items + 1] = { title = row.title, menu = nested }
-
     else
       items[#items + 1] = {
         title = row.hint and (row.title .. "   " .. row.hint) or row.title,
@@ -341,6 +461,20 @@ local function nativeMenu()
 end
 
 -- ------------------------------------------------------------------ control
+
+--- Clicking the pet opens the board. It never triggers a Claude call — ranking
+--- is always something you ask for.
+function M.toggleBoard()
+  if board:isOpen() then
+    board:hide()
+    state.boardOpen = false
+  else
+    board:setAnchor(pet:frame())
+    board:show(compose())
+    state.boardOpen = true
+  end
+  State.save(state)
+end
 
 function M.show()
   pet:show()
@@ -358,22 +492,42 @@ function M.toggle()
   if pet:isHidden() then M.show() else M.hide() end
 end
 
---- Current internals, for troubleshooting from the Hammerspoon console.
+function M.chooseSprite()
+  local picked = hs.dialog.chooseFileOrFolder(
+    "Pick a PNG for your pet", os.getenv("HOME"), true, false, false, { "png" })
+  if not picked or not picked["1"] then return end
+
+  local input = io.open(picked["1"], "rb")
+  if not input then return hs.alert.show("cost: couldn't read that file") end
+  local bytes = input:read("*a")
+  input:close()
+
+  local output = io.open(hs.configdir .. "/cost/assets/pet.png", "wb")
+  if not output then return hs.alert.show("cost: couldn't write the sprite") end
+  output:write(bytes)
+  output:close()
+
+  pet:reskin()
+  redraw()
+  hs.alert.show("cost: new sprite in place")
+end
+
 function M.debug()
   return {
     hidden = pet and pet:isHidden(),
+    scope = scope(),
     theme = themes.id,
-    petWidth = state.petWidth,
-    boardOpen = board and board:isOpen(),
-    generatedAt = generatedAt and os.date("%Y-%m-%d %H:%M", generatedAt) or nil,
-    stale = isStale(),
-    engine = data and data.engine or nil,
-    useAI = state.useAI,
+    counts = {
+      daily = Priorities.count(lists, "daily"),
+      weekly = Priorities.count(lists, "weekly"),
+      monthly = Priorities.count(lists, "monthly"),
+    },
+    events = #events,
+    calendarNote = calendarNote,
+    busy = busy,
     claude = Brain.executable() or "not found",
-    helper = require("cost.sources.calendar").available(),
-    priorities = data and #(data.priorities or {}) or 0,
-    rest = data and #(data.rest or {}) or 0,
-    position = pet and { x = pet.baseX, y = pet.baseY } or nil,
+    helper = Calendar.available(),
+    file = Priorities.file,
   }
 end
 
@@ -382,19 +536,22 @@ end
 local function start()
   state = State.load()
   themes.set(state.theme or "claude")
+  lists = Priorities.load()
 
   pet = Pet.new({
     state = state,
     onClick = function() M.toggleBoard() end,
     onDragEnd = function()
       State.save(state)
-      board:setAnchor(pet:frame())
+      if board then board:setAnchor(pet:frame()) end
     end,
   })
   if not pet then return end
 
   board = Board.new({
-    onRefresh = function() M.refresh({ open = true }) end,
+    onRefresh = function() M.rank() end,
+    onScope = function(id) M.setScope(id) end,
+    onRow = function(row) M.onRow(row) end,
   })
   board:setAnchor(pet:frame())
   menu = Menu.new()
@@ -403,8 +560,6 @@ local function start()
   if menubar then
     local icon = hs.image.imageFromPath(hs.configdir .. "/cost/assets/pet.png")
     if icon then
-      -- Sized to the sprite's own proportions rather than a square, so the
-      -- menu bar doesn't squash whichever drawing is in assets/.
       local size = icon:size()
       local h = 18
       menubar:setIcon(icon:setSize({ w = math.floor(h * (size.w / size.h) + 0.5), h = h }), false)
@@ -416,39 +571,31 @@ local function start()
 
   hotkey = hs.hotkey.bind(HOTKEY[1], HOTKEY[2], function() M.toggle() end)
 
-  -- Today's ranking, if it was already worked out. Costs nothing and means a
-  -- reload never re-ranks a day that's already ranked.
-  Cache.prune()
-  local cached = Cache.read()
-  if cached and cached.priorities then
-    data = cached
-    generatedAt = cached.generatedAt
-  end
-
-  -- The morning briefing. doAt alone is not enough: it silently skips when the
-  -- Mac is asleep at the appointed time, which for a 7am job is the normal case
-  -- rather than the exception. The wake watcher is what actually makes this
-  -- fire most mornings.
-  morningTimer = hs.timer.doAt(MORNING, "1d", function() M.refreshIfStale() end)
+  -- The calendar refreshes on its own because it is free and local. Claude
+  -- never does — that only happens when asked.
+  M.refreshCalendar()
 
   waker = hs.caffeinate.watcher.new(function(event)
     if event == hs.caffeinate.watcher.systemDidWake
        or event == hs.caffeinate.watcher.screensDidUnlock then
-      -- Let the network and calendar sync settle before asking.
-      hs.timer.doAfter(6, function() M.refreshIfStale() end)
+      hs.timer.doAfter(6, function() M.refreshCalendar() end)
     end
   end)
   waker:start()
 
-  -- Register with the pet bus so a manager can hide or quit every pet at once.
   _G.PETS = _G.PETS or {}
   _G.PETS.cost = {
-    name = "cost", label = "Cost", version = "0.1.0", api = 1,
+    name = "cost", label = "Cost", version = "0.2.0", api = 1,
 
     show = M.show, hide = M.hide, toggle = M.toggle, menu = M.showMenu,
-    refresh = function() M.refresh({ open = true }) end,
+    refresh = function() M.refreshCalendar() end,
     isHidden = function() return pet and pet:isHidden() end,
     frame    = function() return pet and pet:frame() end,
+
+    -- Named so custom command bindings can reach them by action name.
+    board = function() M.toggleBoard() end,
+    add   = function() M.promptAdd() end,
+    rank  = function() M.rank() end,
 
     moveTo = function(x, y)
       if not pet then return end
@@ -458,14 +605,12 @@ local function start()
       board:setAnchor(pet:frame())
     end,
 
-    -- Idempotent: the manager calls this twice on "turn off".
     quit = function()
       if menu then menu:hide() end
       if board then board:delete(); board = nil end
       if pet then pet:delete(); pet = nil end
       if menubar then menubar:delete(); menubar = nil end
       if hotkey then hotkey:delete(); hotkey = nil end
-      if morningTimer then morningTimer:stop(); morningTimer = nil end
       if waker then waker:stop(); waker = nil end
     end,
   }

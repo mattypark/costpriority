@@ -91,23 +91,35 @@ function Board:layout()
     end
   end
 
-  local rest = data.rest or {}
-  if #rest > 0 then
+  -- A titled block of plain lines: unranked items, completed items, the day's
+  -- calendar. Same shape each time, so adding another section is one call.
+  local function section(title, items, prefix)
+    if not items or #items == 0 then return end
+
     y = y + 2
     rows[#rows + 1] = { kind = "rule", y = y, h = 1 }
     y = y + 11
 
-    rows[#rows + 1] = { kind = "restHeader", y = y, h = 14 }
+    rows[#rows + 1] = { kind = "sectionHeader", title = title, y = y, h = 14 }
     y = y + 18
 
-    for _, item in ipairs(rest) do
-      local text = "· " .. (item.title or "")
-      local h = textHeight(text, themes.bodySize, innerW)
-      rows[#rows + 1] = { kind = "rest", item = item, text = text, y = y, h = h }
+    for _, item in ipairs(items) do
+      local text = (prefix or "· ") .. (item.title or "")
+      local h = textHeight(text, themes.bodySize, innerW - 52)
+      rows[#rows + 1] = {
+        kind = "line", item = item, text = text,
+        note = item.why, y = y, h = h,
+      }
       y = y + h + 4
     end
     y = y - 4
   end
+
+  section(data.restTitle or "EVERYTHING ELSE", data.rest)
+  section("DONE", data.done, "✓ ")
+  -- The calendar is shown whatever state it is in. An empty board that says
+  -- nothing about the day is worse than one that says the day is over.
+  section(data.calendarTitle or "TODAY'S CALENDAR", data.calendar)
 
   if data.note and data.note ~= "" then
     y = y + 10
@@ -143,13 +155,45 @@ function Board:render()
     frame = { x = 0, y = 0, w = w, h = self.height },
   })
 
-  -- Header: the date on the left, refresh and close on the right.
+  -- Header: scope tabs on the left, refresh and close on the right.
   local data = self.data or {}
-  canvas:appendElements({
-    type = "text",
-    text = styled(string.upper(data.heading or "TODAY"), themes.smallSize, palette.dim),
-    frame = { x = pad, y = pad - 2, w = innerW - 60, h = 16 },
-  })
+  self.tabs = {}
+
+  if data.scopes then
+    local x = pad
+    for _, scope in ipairs(data.scopes) do
+      local active = (scope.id == data.scope)
+      local label = scope.label .. (scope.count > 0 and ("  " .. scope.count) or "")
+      local width = #label * 7 + 12
+
+      if active then
+        canvas:appendElements({
+          type = "rectangle",
+          action = "fill",
+          roundedRectRadii = { xRadius = 6, yRadius = 6 },
+          fillColor = palette.hover,
+          frame = { x = x - 5, y = pad - 5, w = width, h = 21 },
+        })
+      end
+
+      canvas:appendElements({
+        type = "text",
+        text = styled(label, themes.smallSize,
+                      active and palette.accent or palette.dim),
+        frame = { x = x, y = pad - 2, w = width, h = 16 },
+      })
+
+      self.tabs[#self.tabs + 1] = { id = scope.id, x = x - 5, w = width }
+      x = x + width + 6
+    end
+
+  else
+    canvas:appendElements({
+      type = "text",
+      text = styled(string.upper(data.heading or "TODAY"), themes.smallSize, palette.dim),
+      frame = { x = pad, y = pad - 2, w = innerW - 60, h = 16 },
+    })
+  end
 
   canvas:appendElements({
     type = "text",
@@ -204,19 +248,29 @@ function Board:render()
         frame = { x = pad, y = row.y, w = innerW, h = 1 },
       })
 
-    elseif row.kind == "restHeader" then
+    elseif row.kind == "sectionHeader" then
       canvas:appendElements({
         type = "text",
-        text = styled("EVERYTHING ELSE", themes.smallSize, palette.dim),
+        text = styled(row.title, themes.smallSize, palette.dim),
         frame = { x = pad, y = row.y, w = innerW, h = 16 },
       })
 
-    elseif row.kind == "rest" then
+    elseif row.kind == "line" then
+      local hovered = (self.hover == index)
       canvas:appendElements({
         type = "text",
-        text = styled(row.text, themes.bodySize, palette.dim, "left", true),
-        frame = { x = pad, y = row.y, w = innerW, h = row.h },
+        text = styled(row.text, themes.bodySize,
+                      hovered and palette.accent or palette.dim, "left", true),
+        frame = { x = pad, y = row.y, w = innerW - 52, h = row.h },
       })
+
+      if row.note and row.note ~= "" then
+        canvas:appendElements({
+          type = "text",
+          text = styled(row.note, themes.smallSize, palette.dim, "right"),
+          frame = { x = w - pad - 50, y = row.y, w = 50, h = 16 },
+        })
+      end
 
     elseif row.kind == "empty" then
       canvas:appendElements({
@@ -237,7 +291,7 @@ end
 
 -- --------------------------------------------------------------- hit testing
 
---- Returns "close", "refresh", a row index, or nil.
+--- Returns "close", "refresh", { tab = id }, a row index, or nil.
 function Board:hitAt(x, y)
   local w = themes.boardW
   local headerBottom = themes.boardPad + 22
@@ -245,11 +299,17 @@ function Board:hitAt(x, y)
   if y <= headerBottom then
     if x >= w - CLOSE.hit then return "close" end
     if x >= w - CLOSE.hit - REFRESH.hit then return "refresh" end
+
+    for _, tab in ipairs(self.tabs or {}) do
+      if x >= tab.x and x < (tab.x + tab.w) then return { tab = tab.id } end
+    end
     return nil
   end
 
   for index, row in ipairs(self.rows) do
-    if row.kind == "priority" and y >= row.y and y < (row.y + row.h + themes.rowGap) then
+    local reach = (row.kind == "priority") and themes.rowGap or 4
+    if (row.kind == "priority" or row.kind == "line")
+       and y >= row.y and y < (row.y + row.h + reach) then
       return index
     end
   end
@@ -325,13 +385,16 @@ function Board:show(data)
 
     elseif event == "mouseUp" then
       local hit = self:hitAt(cx, cy)
+
       if hit == "close" then
         self:hide()
       elseif hit == "refresh" then
         if self.onRefresh then self.onRefresh() end
+      elseif type(hit) == "table" and hit.tab then
+        if self.onScope then self.onScope(hit.tab) end
       elseif type(hit) == "number" then
         local row = self.rows[hit]
-        if row and row.item and self.onRow then self.onRow(row.item) end
+        if row and row.item and self.onRow then self.onRow(row.item, row.kind) end
       end
     end
   end)
