@@ -12,6 +12,8 @@ Board.__index = Board
 local FADE = 0.14
 local CLOSE = { size = 16, hit = 26, inset = 12 }
 local REFRESH = { size = 16, hit = 26, inset = 38 }
+-- Clicking the pet opens the board, so the menu needs its own way in.
+local MENU = { size = 16, hit = 26, inset = 64 }
 
 function Board.new(opts)
   opts = opts or {}
@@ -20,6 +22,9 @@ function Board.new(opts)
     data = nil,
     onRefresh = opts.onRefresh,
     onRow = opts.onRow,
+    onScope = opts.onScope,   -- clicking a Daily/Weekly/Monthly tab
+    onMenu = opts.onMenu,     -- the ⋯ button
+    tabs = {},
   }, Board)
 end
 
@@ -36,15 +41,55 @@ local function styled(text, size, color, align, wrap)
   })
 end
 
---- Height a wrapped string needs at a given width. hs.drawing measures without
---- drawing anything, which is how the panel sizes itself to its content instead
---- of clipping it.
+--- Wrap to a pixel width.
+---
+--- hs.drawing.getTextDrawingSize takes a *style* as its second argument, not a
+--- size — there is no width to constrain against, so it always reports a single
+--- line and every wrapped block was being clipped to one. Menlo is monospace, so
+--- the honest fix is to wrap ourselves: the advance width is a fixed fraction of
+--- the point size, which makes the character count per line exact.
+local function wrap(text, size, width)
+  local perLine = math.max(8, math.floor(width / (size * 0.6)))
+  local lines = {}
+
+  for paragraph in (tostring(text) .. "\n"):gmatch("(.-)\n") do
+    if paragraph == "" then
+      lines[#lines + 1] = ""
+    else
+      local line = ""
+      for word in paragraph:gmatch("%S+") do
+        if line == "" then
+          line = word
+        elseif #line + 1 + #word <= perLine then
+          line = line .. " " .. word
+        else
+          lines[#lines + 1] = line
+          line = word
+        end
+
+        -- A single word longer than the line has to be broken, or it would
+        -- overflow the bubble instead of wrapping.
+        while #line > perLine do
+          lines[#lines + 1] = line:sub(1, perLine)
+          line = line:sub(perLine + 1)
+        end
+      end
+      if line ~= "" then lines[#lines + 1] = line end
+    end
+  end
+
+  if #lines == 0 then lines[1] = "" end
+  return table.concat(lines, "\n"), #lines
+end
+
+local function lineHeight(size)
+  return math.ceil(size * 1.42)
+end
+
+--- Height only, for rows that draw their own text.
 local function textHeight(text, size, width)
-  local measured = hs.drawing.getTextDrawingSize(
-    styled(text, size, { white = 0 }, "left", true),
-    { w = width, h = 10000 }
-  )
-  return math.ceil((measured and measured.h or size + 4) + 1)
+  local _, count = wrap(text, size, width)
+  return count * lineHeight(size) + 2
 end
 
 -- ------------------------------------------------------------------ layout
@@ -117,9 +162,40 @@ function Board:layout()
 
   section(data.restTitle or "EVERYTHING ELSE", data.rest)
   section("DONE", data.done, "✓ ")
-  -- The calendar is shown whatever state it is in. An empty board that says
-  -- nothing about the day is worse than one that says the day is over.
-  section(data.calendarTitle or "TODAY'S CALENDAR", data.calendar)
+
+  -- The calendar is drawn as blocks rather than a list, because that is what a
+  -- calendar looks like and the shape carries information a bullet cannot: how
+  -- long something is, which calendar it came from, whether it has passed. It
+  -- is shown whatever state it is in — a board that says nothing about the day
+  -- is worse than one that says the day is over.
+  local calendar = data.calendar or {}
+  y = y + 2
+  rows[#rows + 1] = { kind = "rule", y = y, h = 1 }
+  y = y + 11
+  rows[#rows + 1] = {
+    kind = "sectionHeader", title = data.calendarTitle or "TODAY'S CALENDAR",
+    y = y, h = 14,
+  }
+  y = y + 20
+
+  if #calendar == 0 then
+    rows[#rows + 1] = {
+      kind = "empty", text = data.calendarEmpty or "Nothing scheduled.", y = y,
+      h = textHeight(data.calendarEmpty or "Nothing scheduled.", themes.bodySize, innerW),
+    }
+    y = y + rows[#rows].h
+
+  else
+    for _, item in ipairs(calendar) do
+      local titleH = textHeight(item.title or "", themes.bodySize, innerW - 22)
+      -- Every block gets a time line under the title, so height is title plus
+      -- one line plus padding — never shorter than a comfortable tap target.
+      local h = math.max(38, titleH + 14 + 10)
+      rows[#rows + 1] = { kind = "block", item = item, y = y, h = h, titleH = titleH }
+      y = y + h + 5
+    end
+    y = y - 5
+  end
 
   if data.note and data.note ~= "" then
     y = y + 10
@@ -164,7 +240,12 @@ function Board:render()
     for _, scope in ipairs(data.scopes) do
       local active = (scope.id == data.scope)
       local label = scope.label .. (scope.count > 0 and ("  " .. scope.count) or "")
-      local width = #label * 7 + 12
+      -- Menlo's advance is 0.6em, so the text width is exact. The pill is that
+      -- plus equal padding either side; deriving the pill from the text (rather
+      -- than the text from a guessed pill) is what keeps it centred on labels
+      -- of different lengths.
+      local textW = math.ceil(#label * themes.smallSize * 0.6)
+      local width = textW + 16
 
       if active then
         canvas:appendElements({
@@ -172,7 +253,7 @@ function Board:render()
           action = "fill",
           roundedRectRadii = { xRadius = 6, yRadius = 6 },
           fillColor = palette.hover,
-          frame = { x = x - 5, y = pad - 5, w = width, h = 21 },
+          frame = { x = x - 8, y = pad - 5, w = width, h = 21 },
         })
       end
 
@@ -180,12 +261,35 @@ function Board:render()
         type = "text",
         text = styled(label, themes.smallSize,
                       active and palette.accent or palette.dim),
-        frame = { x = x, y = pad - 2, w = width, h = 16 },
+        frame = { x = x, y = pad - 2, w = textW + 2, h = 16 },
       })
 
-      self.tabs[#self.tabs + 1] = { id = scope.id, x = x - 5, w = width }
-      x = x + width + 6
+      self.tabs[#self.tabs + 1] = { id = scope.id, x = x - 8, w = width }
+      x = x + width
     end
+
+    -- Settings lives with the scope tabs rather than only behind ⋯, because
+    -- that is where it was looked for.
+    local label = "Settings"
+    local textW = math.ceil(#label * themes.smallSize * 0.6)
+    local width = textW + 16
+
+    if self.hover == "menu" then
+      canvas:appendElements({
+        type = "rectangle",
+        action = "fill",
+        roundedRectRadii = { xRadius = 6, yRadius = 6 },
+        fillColor = palette.hover,
+        frame = { x = x - 8, y = pad - 5, w = width, h = 21 },
+      })
+    end
+    canvas:appendElements({
+      type = "text",
+      text = styled(label, themes.smallSize,
+                    self.hover == "menu" and palette.accent or palette.dim),
+      frame = { x = x, y = pad - 2, w = textW + 2, h = 16 },
+    })
+    self.settingsTab = { x = x - 8, w = width }
 
   else
     canvas:appendElements({
@@ -248,6 +352,63 @@ function Board:render()
         frame = { x = pad, y = row.y, w = innerW, h = 1 },
       })
 
+    elseif row.kind == "block" then
+      local item = row.item
+      local hovered = (self.hover == index)
+
+      -- The calendar's own colour, dimmed for anything already finished so the
+      -- day reads at a glance: bright is ahead of you, faded is behind.
+      local base = item.color
+        and { red = item.color[1], green = item.color[2], blue = item.color[3], alpha = 1 }
+        or palette.accent
+      local past = (item.state == "done")
+      -- Some calendars are grey. A weak tint on grey is indistinguishable from
+      -- the card, so blocks carry a visible border as well as a fill.
+      local fillA = past and 0.14 or 0.30
+      local barA = past and 0.40 or 1.0
+
+      canvas:appendElements({
+        type = "rectangle",
+        action = "fill",
+        roundedRectRadii = { xRadius = 7, yRadius = 7 },
+        fillColor = { red = base.red, green = base.green, blue = base.blue,
+                      alpha = hovered and (fillA + 0.12) or fillA },
+        frame = { x = pad, y = row.y, w = innerW, h = row.h },
+      })
+
+      canvas:appendElements({
+        type = "rectangle",
+        action = "stroke",
+        roundedRectRadii = { xRadius = 7, yRadius = 7 },
+        strokeColor = { red = base.red, green = base.green, blue = base.blue,
+                        alpha = past and 0.30 or 0.55 },
+        strokeWidth = 1,
+        frame = { x = pad, y = row.y, w = innerW, h = row.h },
+      })
+
+      -- A solid spine down the left edge, the way calendars mark an event's
+      -- source colour.
+      canvas:appendElements({
+        type = "rectangle",
+        action = "fill",
+        roundedRectRadii = { xRadius = 2, yRadius = 2 },
+        fillColor = { red = base.red, green = base.green, blue = base.blue, alpha = barA },
+        frame = { x = pad + 4, y = row.y + 5, w = 3, h = row.h - 10 },
+      })
+
+      canvas:appendElements({
+        type = "text",
+        text = styled(item.title or "", themes.bodySize,
+                      past and palette.dim or palette.text, "left", true),
+        frame = { x = pad + 14, y = row.y + 5, w = innerW - 22, h = row.titleH },
+      })
+
+      canvas:appendElements({
+        type = "text",
+        text = styled(item.when or "", themes.smallSize, palette.dim),
+        frame = { x = pad + 14, y = row.y + 5 + row.titleH, w = innerW - 22, h = 14 },
+      })
+
     elseif row.kind == "sectionHeader" then
       canvas:appendElements({
         type = "text",
@@ -294,7 +455,9 @@ end
 --- Returns "close", "refresh", { tab = id }, a row index, or nil.
 function Board:hitAt(x, y)
   local w = themes.boardW
-  local headerBottom = themes.boardPad + 22
+  -- Generous, because the tabs are small text and a near miss reads as the
+  -- board being unresponsive rather than as a miss.
+  local headerBottom = themes.boardPad + 26
 
   if y <= headerBottom then
     if x >= w - CLOSE.hit then return "close" end
@@ -302,6 +465,11 @@ function Board:hitAt(x, y)
 
     for _, tab in ipairs(self.tabs or {}) do
       if x >= tab.x and x < (tab.x + tab.w) then return { tab = tab.id } end
+    end
+
+    local settings = self.settingsTab
+    if settings and x >= settings.x and x < (settings.x + settings.w) then
+      return "menu"
     end
     return nil
   end
@@ -390,6 +558,8 @@ function Board:show(data)
         self:hide()
       elseif hit == "refresh" then
         if self.onRefresh then self.onRefresh() end
+      elseif hit == "menu" then
+        if self.onMenu then self.onMenu() end
       elseif type(hit) == "table" and hit.tab then
         if self.onScope then self.onScope(hit.tab) end
       elseif type(hit) == "number" then

@@ -9,15 +9,19 @@ local KEY = "cost.state"
 
 local defaults = {
   hidden    = false,
-  theme     = "claude",
+  theme     = "cost",
   petWidth  = 96,
   boardOpen = false,
   scope     = "daily",   -- which list the board is showing
+  -- Which calendars to read. Empty means all of them, which is the right
+  -- default: a fresh install should show your day, not nothing.
+  calendars = {},
   model     = "",        -- empty = whatever `claude` defaults to
 }
 
 local KEYS = {
-  "x", "y", "hidden", "theme", "petWidth", "boardOpen", "scope", "model", "configured",
+  "x", "y", "hidden", "theme", "petWidth", "boardOpen", "scope", "calendars",
+  "model", "configured",
 }
 
 local State = {}

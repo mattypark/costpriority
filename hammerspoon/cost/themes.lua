@@ -13,9 +13,41 @@ local function rgb(r, g, b, a)
 end
 
 -- Order the menu lists them in.
-Themes.order = { "claude", "midnight", "mono", "ember", "forest", "plum", "sand", "matrix" }
+Themes.order = {
+  "cost", "kaws", "claude", "midnight", "mono", "ember", "forest", "plum",
+  "sand", "matrix",
+}
 
 local palettes = {
+  -- The pet is a green ghost on cream; the default theme should look like him
+  -- rather than like Claude.
+  cost = {
+    label = "Cost", dark = false,
+    card   = rgb(0.98, 0.97, 0.94, 0.99),
+    stroke = rgb(0.36, 0.52, 0.38, 0.30),
+    text   = rgb(0.11, 0.15, 0.12),
+    dim    = rgb(0.42, 0.48, 0.43),
+    accent = rgb(0.35, 0.56, 0.38),
+    hover  = rgb(0.35, 0.56, 0.38, 0.13),
+    rule   = rgb(0.16, 0.24, 0.18, 0.13),
+    p0 = rgb(0.72, 0.30, 0.18), p1 = rgb(0.35, 0.56, 0.38),
+    p2 = rgb(0.44, 0.55, 0.48), p3 = rgb(0.52, 0.56, 0.53),
+  },
+
+  -- Bone white, heavy black, one loud accent — the palette the name suggests.
+  kaws = {
+    label = "Kaws", dark = false,
+    card   = rgb(0.96, 0.95, 0.92, 0.99),
+    stroke = rgb(0.06, 0.06, 0.06, 0.55),
+    text   = rgb(0.05, 0.05, 0.05),
+    dim    = rgb(0.40, 0.40, 0.40),
+    accent = rgb(0.85, 0.24, 0.16),
+    hover  = rgb(0.06, 0.06, 0.06, 0.08),
+    rule   = rgb(0.06, 0.06, 0.06, 0.22),
+    p0 = rgb(0.85, 0.24, 0.16), p1 = rgb(0.06, 0.06, 0.06),
+    p2 = rgb(0.42, 0.42, 0.42), p3 = rgb(0.62, 0.62, 0.62),
+  },
+
   claude = {
     label = "Claude", dark = false,
     card   = rgb(0.99, 0.97, 0.94, 0.99),
@@ -121,10 +153,10 @@ local palettes = {
   },
 }
 
-Themes.id = "claude"
+Themes.id = "cost"
 
 function Themes.palette()
-  return palettes[Themes.id] or palettes.claude
+  return palettes[Themes.id] or palettes.cost
 end
 
 function Themes.get(id)
@@ -138,7 +170,7 @@ end
 
 function Themes.label(id)
   local palette = palettes[id or Themes.id]
-  return palette and palette.label or "Claude"
+  return palette and palette.label or "Cost"
 end
 
 --- Colour for a rank label. Unknown ranks fall back to the "everything else"

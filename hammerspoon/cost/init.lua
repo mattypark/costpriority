@@ -12,6 +12,8 @@ local Board      = require("cost.board")
 local Menu       = require("cost.menu")
 local Priorities = require("cost.priorities")
 local Input      = require("cost.input")
+local Bubble     = require("cost.bubble")
+local Intent     = require("cost.intent")
 local Brain      = require("cost.brain")
 local Calendar   = require("cost.sources.calendar")
 local themes     = require("cost.themes")
@@ -23,10 +25,12 @@ local HOTKEY_HINT = "⌃⌥⌘I"
 local ASK_HOTKEY = { { "ctrl", "alt", "cmd" }, "k" }
 local ASK_HINT = "⌃⌥⌘K"
 
-local state, pet, board, menu, menubar, hotkey, askHotkey, waker
+local state, pet, board, menu, menubar, hotkey, askHotkey, waker, bubble
 local lists                    -- the three priority lists
 local events = {}              -- today's calendar, for context
 local calendarNote             -- why the calendar is missing, when it is
+local calendars = {}           -- writable calendar names, from the helper
+local defaultCalendar          -- where a new event lands by default
 local busy = false             -- a Claude call is in flight
 
 -- ------------------------------------------------------------------- helpers
@@ -35,14 +39,23 @@ local function scope()
   return state.scope or "daily"
 end
 
---- "in 2h", "12:30", "all day" — short enough for the right-hand column.
-local function eventNote(event, now)
+--- The time line under a block's title: "09:30 – 10:15", or "all day".
+local function eventWhen(event)
   if event.allDay then return "all day" end
   if not event.start then return "" end
 
+  local from = os.date("%H:%M", event.start)
+  if not event.endTime then return from end
+  return from .. " – " .. os.date("%H:%M", event.endTime)
+end
+
+--- done / now / ahead — drives how strongly the block is drawn.
+local function eventState(event, now)
+  if event.allDay then return "ahead" end
+  if not event.start then return "ahead" end
   if event.endTime and event.endTime <= now then return "done" end
   if event.start <= now then return "now" end
-  return os.date("%H:%M", event.start)
+  return "ahead"
 end
 
 -- --------------------------------------------------------------------- board
@@ -78,11 +91,54 @@ local function compose()
   local now = os.time()
   local calendarRows = {}
   for _, event in ipairs(events) do
+    -- Named `phase`, not `state`: `state` is the settings table in this file's
+    -- scope and shadowing it here would be a trap for the next change.
+    local phase = eventState(event, now)
     calendarRows[#calendarRows + 1] = {
       title = event.title or "Untitled",
-      why = eventNote(event, now),
+      when = eventWhen(event) .. (phase == "now" and "  ·  now" or ""),
+      state = phase,
+      color = event.color,
+      sortKey = event.allDay and 0 or (event.start or math.huge),
       calendarEvent = true,
     }
+  end
+
+  -- Chronological, so the column reads like a day. All-day events sort first,
+  -- the way a calendar puts them across the top.
+  table.sort(calendarRows, function(a, b)
+    if a.sortKey ~= b.sortKey then return a.sortKey < b.sortKey end
+    return (a.title or "") < (b.title or "")
+  end)
+
+  -- Past today, listing every event is unreadable — a month of a repeating
+  -- morning routine is hundreds of rows saying nothing. Collapse to a count per
+  -- day instead, which is the thing you actually want to know at that range.
+  local calendarTitle = "TODAY'S CALENDAR"
+  if scope() ~= "daily" then
+    local perDay, order = {}, {}
+    for _, event in ipairs(events) do
+      local key = os.date("%Y-%m-%d", event.start or now)
+      if not perDay[key] then
+        perDay[key] = { count = 0, label = os.date("%a %d %b", event.start or now) }
+        order[#order + 1] = key
+      end
+      perDay[key].count = perDay[key].count + 1
+    end
+    table.sort(order)
+
+    calendarRows = {}
+    for _, key in ipairs(order) do
+      local day = perDay[key]
+      calendarRows[#calendarRows + 1] = {
+        title = day.label,
+        when = day.count .. (day.count == 1 and " event" or " events"),
+        state = (key < os.date("%Y-%m-%d")) and "done" or "ahead",
+        compact = true,
+      }
+    end
+    calendarTitle = (scope() == "weekly" and "NEXT 7 DAYS" or "NEXT 31 DAYS")
+      .. "  ·  " .. #events .. (#events == 1 and " event" or " events")
   end
 
   local scopes = {}
@@ -118,8 +174,10 @@ local function compose()
     restTitle = "NOT RANKED",
     done = doneRows,
     calendar = calendarRows,
-    calendarTitle = "TODAY'S CALENDAR" ..
-                    (#calendarRows == 0 and " — nothing scheduled" or ""),
+    calendarTitle = calendarTitle,
+    calendarEmpty = (state.calendars and #state.calendars > 0)
+      and "Nothing today on the calendars you picked."
+      or "Nothing scheduled today.",
     empty = empty,
     note = note,
   }
@@ -142,18 +200,41 @@ end
 
 --- Refresh the calendar only. Never calls Claude, so this is free and safe to
 --- run in the background.
+--- How far ahead each scope looks. Daily wants blocks for today; weekly and
+--- monthly want a count, not a wall of every event in the range.
+local SPAN = { daily = 1, weekly = 7, monthly = 31 }
+
 function M.refreshCalendar(callback)
-  Calendar.fetch(function(fetched, err)
+  Calendar.fetch(function(fetched, err, meta)
     if err then
       calendarNote = "Calendar unavailable — " .. err
       events = {}
     else
       calendarNote = nil
-      events = fetched or {}
+      -- Which calendars can be written to, so the parser never invents a name.
+      calendars = (meta and meta.calendars) or calendars
+      defaultCalendar = (meta and meta.defaultCalendar) or defaultCalendar
+
+      -- Honour the chosen subset. An empty selection means all of them: with
+      -- fifteen calendars synced, showing every one is noise, but showing none
+      -- would look broken on a fresh install.
+      local wanted = {}
+      local filtering = false
+      for _, name in ipairs(state.calendars or {}) do
+        wanted[name] = true
+        filtering = true
+      end
+
+      events = {}
+      for _, event in ipairs(fetched or {}) do
+        if not filtering or wanted[event.calendar] then
+          events[#events + 1] = event
+        end
+      end
     end
     redraw()
     if callback then callback() end
-  end)
+  end, SPAN[scope()] or 1)
 end
 
 -- ------------------------------------------------------------------- ranking
@@ -218,6 +299,9 @@ function M.setScope(id)
   state.scope = id
   State.save(state)
   redraw()
+  -- Each scope looks at a different window, so the calendar has to be refetched
+  -- rather than re-sliced from what we already hold.
+  M.refreshCalendar()
 end
 
 --- Clicking an item toggles it done. Direct, reversible, and the thing you want
@@ -250,6 +334,122 @@ function M.promptAdd(targetScope)
       board:setAnchor(pet:frame())
       board:show(compose())
     end
+  end)
+end
+
+-- ------------------------------------------------------------------- talking
+
+--- Show what was parsed and wait for a yes.
+---
+--- Always, for every write. The model resolves dates, and a date resolved wrongly
+--- puts a real event in a real calendar where you may not notice it for weeks.
+--- Reading back an absolute date is the only way to catch that.
+local function confirm(intent, onYes)
+  local title, detail = Intent.describe(intent)
+
+  say(detail, {
+    title = title,
+    actions = {
+      { title = "Do it", fn = onYes },
+      { title = "Cancel", fn = function() end },
+    },
+  })
+end
+
+--- Speak. The bubble stays until dismissed — a message you missed is a message
+--- that may as well not have been shown.
+local function say(message, opts)
+  if not message or message == "" then
+    bubble:hide()
+    calendarNote = nil
+    redraw()
+    return
+  end
+
+  bubble:setAnchor(pet:frame())
+  bubble:say(message, opts)
+end
+
+--- Apply a validated intent. Reads route straight through; every write goes via
+--- confirm() first.
+local function perform(intent)
+  if intent.action == "priority" then
+    M.addPriority(intent.text, intent.scope)
+    if not board:isOpen() then M.toggleBoard() end
+    return
+  end
+
+  if intent.action == "ask" or intent.action == "unclear" then
+    say(intent.answer, { title = "cost" })
+    return
+  end
+
+  confirm(intent, function()
+    local mode = intent.action
+    local spec
+
+    if mode == "add" then
+      spec = {
+        title = intent.title, start = intent.start, ["end"] = intent["end"],
+        allDay = intent.allDay, calendar = intent.calendar,
+      }
+    elseif mode == "move" then
+      spec = { uid = intent.uid, start = intent.start, ["end"] = intent["end"] }
+    else
+      spec = { uid = intent.uid }
+    end
+
+    say("Working on it…", { title = "cost" })
+    Calendar.write(mode, spec, function(_, err)
+      if err then
+        say(err, { title = "couldn't " .. mode })
+        return
+      end
+      -- Re-read rather than patching the local copy: the calendar is the source
+      -- of truth and it may have changed other things too.
+      M.refreshCalendar(function() say(nil) end)
+    end)
+  end)
+end
+
+--- The main way in: say something, it works out what you meant.
+function M.talk()
+  Input.show({
+    anchor = pet:frame(),
+    hint = "TELL COST",
+    placeholder = "a priority, an event, or a question…",
+  }, function(text)
+    if not Brain.available() then
+      -- Without the CLI there is nothing to parse with, so treat it as a plain
+      -- priority rather than failing.
+      M.addPriority(text, scope())
+      if not board:isOpen() then M.toggleBoard() end
+      return
+    end
+
+    busy = true
+    pet:setBusy(true)
+    say("Thinking…", { title = "cost" })
+
+    Brain.parseIntent(text, events, calendars, defaultCalendar,
+      { model = state.model }, function(raw, err)
+        busy = false
+        pet:setBusy(false)
+
+        if not raw then
+          say(tostring(err), { title = "couldn't understand that" })
+          return
+        end
+
+        local intent, invalid = Intent.validate(raw, events)
+        if not intent then
+          say(tostring(invalid), { title = "couldn't do that" })
+          return
+        end
+
+        calendarNote = nil
+        perform(intent)
+      end)
   end)
 end
 
@@ -347,6 +547,76 @@ local function itemPage(item)
   return rows
 end
 
+--- Which calendars cost reads. Nothing selected means all of them.
+local function calendarsPage()
+  local chosen = {}
+  local count = 0
+  for _, name in ipairs(state.calendars or {}) do
+    chosen[name] = true
+    count = count + 1
+  end
+  local filtering = count > 0
+
+  local rows = {
+    { kind = "header",
+      title = filtering and ("SHOWING " .. count .. " OF " .. #calendars)
+                        or "SHOWING ALL CALENDARS" },
+  }
+
+  -- Tick as many as you like; the page stays open so picking several is one
+  -- visit rather than one visit each.
+  rows[#rows + 1] = {
+    title = (not filtering and "◉ " or "○ ") .. "All of them",
+    keepOpen = true,
+    rebuild = function() return calendarsPage() end,
+    fn = function()
+      state.calendars = {}
+      State.save(state)
+      M.refreshCalendar()
+    end,
+  }
+  rows[#rows + 1] = { kind = "sep" }
+
+  for _, name in ipairs(calendars) do
+    local on = chosen[name]
+    rows[#rows + 1] = {
+      title = (on and "☑ " or "☐ ") .. name,
+      keepOpen = true,
+      rebuild = function() return calendarsPage() end,
+      fn = function()
+        local next_ = {}
+        for _, existing in ipairs(state.calendars or {}) do
+          if existing ~= name then next_[#next_ + 1] = existing end
+        end
+        if not on then next_[#next_ + 1] = name end
+        state.calendars = next_
+        State.save(state)
+        M.refreshCalendar()
+      end,
+    }
+  end
+
+  if #calendars == 0 then
+    rows[#rows + 1] = { title = "No calendars found yet", hint = nil }
+  end
+
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = { title = "← Back", submenu = function() return actions() end }
+  return rows
+end
+
+local function appearancePage()
+  return {
+    { kind = "header", title = "APPEARANCE" },
+    { title = "Theme", hint = "▸ " .. themes.label(), submenu = themePage },
+    { title = "Pet size", hint = "▸ " .. state.petWidth, submenu = sizePage },
+    { title = "Choose sprite…", preview = "any PNG — copied into assets/",
+      fn = function() M.chooseSprite() end },
+    { kind = "sep" },
+    { title = "← Back", submenu = function() return actions() end },
+  }
+end
+
 local function itemsPage()
   local rows = { { kind = "header", title = "EDIT AN ITEM" } }
 
@@ -363,6 +633,16 @@ local function itemsPage()
   end
 
   rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = {
+    title = "Clear completed",
+    fn = function()
+      Priorities.clearDone(lists, scope())
+      persist()
+      redraw()
+    end,
+  }
+  rows[#rows + 1] = { title = "Refresh calendar", fn = function() M.refreshCalendar() end }
+  rows[#rows + 1] = { kind = "sep" }
   rows[#rows + 1] = { title = "← Back", submenu = function() return actions() end }
   return rows
 end
@@ -371,14 +651,18 @@ function actions()
   local rows = {}
 
   rows[#rows + 1] = {
-    title = "Add a priority…",
+    title = "Tell cost something…",
     hint = ASK_HINT,
+    fn = function() M.talk() end,
+  }
+  rows[#rows + 1] = {
+    title = "Add to " .. Priorities.label[scope()]:lower() .. " list",
+    preview = "typed in exactly as written, no AI",
     fn = function() M.promptAdd() end,
   }
   rows[#rows + 1] = {
     title = "Rank with Claude",
     hint = Brain.available() and "↻" or "no CLI",
-    preview = "orders this list, using your calendar as context",
     fn = function() if Brain.available() then M.rank() end end,
   }
   rows[#rows + 1] = {
@@ -389,34 +673,26 @@ function actions()
   rows[#rows + 1] = { kind = "sep" }
 
   for _, id in ipairs(Priorities.scopes) do
-    local active = (scope() == id)
+    local open = Priorities.count(lists, id)
     rows[#rows + 1] = {
-      title = (active and "● " or "   ") .. Priorities.label[id],
-      hint = Priorities.count(lists, id) > 0 and tostring(Priorities.count(lists, id)) or nil,
+      title = (scope() == id and "● " or "   ") .. Priorities.label[id],
+      hint = open > 0 and tostring(open) or nil,
       fn = function() M.setScope(id) end,
     }
   end
 
+  -- Everything below is grouped into submenus rather than listed flat. The
+  -- drawn menu has no scrolling, so a long top level silently loses its last
+  -- rows off the bottom of the screen.
   rows[#rows + 1] = { kind = "sep" }
-  rows[#rows + 1] = { title = "Edit an item", submenu = itemsPage }
+  rows[#rows + 1] = { title = "Items", hint = "▸", submenu = itemsPage }
   rows[#rows + 1] = {
-    title = "Clear completed",
-    fn = function()
-      Priorities.clearDone(lists, scope())
-      persist()
-      redraw()
-    end,
+    title = "Calendars",
+    hint = "▸ " .. ((state.calendars and #state.calendars > 0)
+                    and (#state.calendars .. " chosen") or "all"),
+    submenu = calendarsPage,
   }
-  rows[#rows + 1] = { title = "Refresh calendar", fn = function() M.refreshCalendar() end }
-
-  rows[#rows + 1] = { kind = "sep" }
-  rows[#rows + 1] = { title = "Theme", hint = "▸ " .. themes.label(), submenu = themePage }
-  rows[#rows + 1] = { title = "Pet size", hint = "▸ " .. state.petWidth, submenu = sizePage }
-  rows[#rows + 1] = {
-    title = "Choose sprite…",
-    preview = "any PNG — it's copied into assets/",
-    fn = function() M.chooseSprite() end,
-  }
+  rows[#rows + 1] = { title = "Appearance", hint = "▸ " .. themes.label(), submenu = appearancePage }
 
   rows[#rows + 1] = { kind = "sep" }
   rows[#rows + 1] = { title = "Hide pet", hint = HOTKEY_HINT, fn = function() M.hide() end }
@@ -547,6 +823,7 @@ local function start()
     onDragEnd = function()
       State.save(state)
       if board then board:setAnchor(pet:frame()) end
+      if bubble then bubble:setAnchor(pet:frame()) end
     end,
   })
   if not pet then return end
@@ -554,10 +831,13 @@ local function start()
   board = Board.new({
     onRefresh = function() M.rank() end,
     onScope = function(id) M.setScope(id) end,
+    onMenu = function() M.showMenu() end,
     onRow = function(row) M.onRow(row) end,
   })
   board:setAnchor(pet:frame())
   menu = Menu.new()
+  bubble = Bubble.new()
+  bubble:setAnchor(pet:frame())
 
   menubar = hs.menubar.new()
   if menubar then
@@ -573,7 +853,7 @@ local function start()
   end
 
   hotkey = hs.hotkey.bind(HOTKEY[1], HOTKEY[2], function() M.toggle() end)
-  askHotkey = hs.hotkey.bind(ASK_HOTKEY[1], ASK_HOTKEY[2], function() M.promptAdd() end)
+  askHotkey = hs.hotkey.bind(ASK_HOTKEY[1], ASK_HOTKEY[2], function() M.talk() end)
 
   -- The calendar refreshes on its own because it is free and local. Claude
   -- never does — that only happens when asked.
@@ -599,6 +879,7 @@ local function start()
     -- Named so custom command bindings can reach them by action name.
     board = function() M.toggleBoard() end,
     add   = function() M.promptAdd() end,
+    talk  = function() M.talk() end,
     rank  = function() M.rank() end,
 
     moveTo = function(x, y)
@@ -612,6 +893,7 @@ local function start()
     quit = function()
       if menu then menu:hide() end
       if board then board:delete(); board = nil end
+      if bubble then bubble:delete(); bubble = nil end
       if pet then pet:delete(); pet = nil end
       if menubar then menubar:delete(); menubar = nil end
       if hotkey then hotkey:delete(); hotkey = nil end

@@ -36,16 +36,101 @@ function Calendar.available()
   return hs.fs.attributes(APP, "mode") == "directory"
 end
 
---- @param callback function(events, err)  events is a list; err is a string
-function Calendar.fetch(callback)
+--- Run a write mode. The spec goes to a file because `open` gives the launched
+--- app no stdin — the same constraint that already forces output to a file.
+---
+--- @param mode string  "add" | "move" | "delete"
+--- @param spec table
+--- @param callback function(event, err)
+function Calendar.write(mode, spec, callback)
+  if not Calendar.available() then
+    callback(nil, "CostCalendar.app is not installed")
+    return
+  end
+
+  local dir = os.getenv("HOME") .. "/.cost"
+  hs.fs.mkdir(dir)
+
+  local specPath = dir .. "/spec.json"
+  local outPath = dir .. "/write.json"
+
+  local file = io.open(specPath, "w")
+  if not file then
+    callback(nil, "couldn't write the request")
+    return
+  end
+  file:write(hs.json.encode(spec))
+  file:close()
+
+  os.remove(outPath)
+
+  local finished = false
+  local task, timeout
+
+  local function finish(event, err)
+    if finished then return end
+    finished = true
+    if timeout then timeout:stop() end
+    os.remove(specPath)
+    callback(event, err)
+  end
+
+  task = hs.task.new("/usr/bin/open", function(exitCode)
+    local handle = io.open(outPath, "r")
+    if not handle then
+      finish(nil, "the helper wrote nothing (exit " .. tostring(exitCode) .. ")")
+      return
+    end
+
+    local raw = handle:read("*a")
+    handle:close()
+
+    local ok, data = pcall(hs.json.decode, raw)
+    if not ok or type(data) ~= "table" then
+      finish(nil, "couldn't read the helper's reply")
+      return
+    end
+
+    if data.error then
+      finish(nil, data.message or data.error)
+      return
+    end
+
+    finish(data.event or {})
+  end, { "-W", "-n", "-a", APP, "--args",
+         "--" .. mode, "--spec", specPath, "--out", outPath })
+
+  if not task then
+    finish(nil, "couldn't launch the calendar helper")
+    return
+  end
+
+  timeout = hs.timer.doAfter(TIMEOUT, function()
+    if task then task:terminate() end
+    finish(nil, "the calendar helper timed out")
+  end)
+
+  task:start()
+end
+
+--- @param callback function(events, err, meta)
+---   events is a list, err a string, meta the helper's full reply — which also
+---   carries the writable calendar names and the default one, needed so the
+---   natural-language parser never invents a calendar that doesn't exist.
+--- @param days number|nil  how many days from today; 1 (today) by default
+function Calendar.fetch(callback, days)
   if not Calendar.available() then
     callback(nil, "CostCalendar.app is not installed — run install.sh")
     return
   end
 
+  -- Cancel-and-replace rather than reject. Switching scope fires a fetch for a
+  -- different window, and refusing it left the board labelled "next 7 days"
+  -- while still showing only today — the label and the data disagreeing is
+  -- worse than a slightly slower switch.
   if running then
-    callback(nil, "already checking the calendar")
-    return
+    running:terminate()
+    running = nil
   end
 
   hs.fs.mkdir(os.getenv("HOME") .. "/.cost")
@@ -54,12 +139,12 @@ function Calendar.fetch(callback)
   local finished = false
   local timeout
 
-  local function finish(events, err)
+  local function finish(events, err, meta)
     if finished then return end
     finished = true
     running = nil
     if timeout then timeout:stop() end
-    callback(events, err)
+    callback(events, err, meta)
   end
 
   running = hs.task.new("/usr/bin/open", function(exitCode)
@@ -77,8 +162,9 @@ function Calendar.fetch(callback)
       return
     end
 
-    finish(data.events or {})
-  end, { "-W", "-n", "-a", APP, "--args", "--out", OUT })
+    finish(data.events or {}, nil, data)
+  end, { "-W", "-n", "-a", APP, "--args", "--out", OUT,
+         "--days", tostring(math.max(1, math.floor(days or 1))) })
 
   if not running then
     finish(nil, "could not launch the calendar helper")

@@ -18,6 +18,7 @@ local Brain = {}
 local CLAUDE = os.getenv("HOME") .. "/.local/bin/claude"
 local PROMPT_FILE = hs.configdir .. "/cost/prompt.md"
 local PRIORITIES_PROMPT = hs.configdir .. "/cost/prompt-priorities.md"
+local INTENT_PROMPT = hs.configdir .. "/cost/prompt-intent.md"
 -- Generous, because it covers the CLI's cold start as well as the request.
 local TIMEOUT = 90
 local MAX_EVENTS = 40      -- a pathological calendar shouldn't blow up the prompt
@@ -350,6 +351,23 @@ function Brain.rank(events, opts, callback)
   if not events or #events == 0 then return callback(nil, "nothing to rank") end
 
   run(prompt, payload(events), opts, Brain.validate, callback)
+end
+
+--- Turn one line of English into a structured action.
+---
+--- The raw object comes back unvalidated on purpose: intent.lua owns that, and
+--- it needs the event list to check uids against, which Brain has no business
+--- knowing about.
+function Brain.parseIntent(text, events, calendars, defaultCalendar, opts, callback)
+  opts = opts or {}
+
+  local prompt = loadPrompt(INTENT_PROMPT)
+  if not prompt then return callback(nil, "prompt-intent.md is missing") end
+
+  local Intent = require("cost.intent")
+  local input = Intent.payload(text, events, calendars, defaultCalendar)
+
+  run(prompt, input, opts, function(raw) return raw end, callback)
 end
 
 --- Rank the user's own list, with the calendar as context.

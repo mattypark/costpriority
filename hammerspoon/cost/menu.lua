@@ -18,6 +18,9 @@ local FADE = 0.10
 local HINT_W = 62      -- fixed right column, so titles can never collide with it
 local TITLE_X = themes.menuPad + 8
 local SWATCH = 10
+-- Clicking outside already dismisses, but an explicit way out is expected.
+-- Its own strip above the rows, so it can never overlap a title.
+local CLOSE = { size = 11, hit = 30, radius = 9, strip = 26 }
 
 function Menu.new()
   return setmetatable({ rows = {}, hovered = nil }, Menu)
@@ -59,7 +62,26 @@ function Menu:render()
     frame = { x = 0, y = 0, w = w, h = self.height },
   })
 
-  local y = themes.menuPad
+  -- A circular button on its own strip, top left.
+  local closeHovered = (self.hovered == "close")
+  canvas:appendElements({
+    type = "circle",
+    action = "strokeAndFill",
+    fillColor = closeHovered and palette.accent or { white = 0, alpha = 0 },
+    strokeColor = closeHovered and palette.accent or palette.rule,
+    strokeWidth = 1,
+    center = { x = themes.menuPad + CLOSE.radius + 2, y = CLOSE.strip / 2 + 3 },
+    radius = CLOSE.radius,
+  })
+  canvas:appendElements({
+    type = "text",
+    text = styled("✕", CLOSE.size,
+                  closeHovered and palette.card or palette.dim, "center"),
+    frame = { x = themes.menuPad + 2, y = CLOSE.strip / 2 - 5,
+              w = CLOSE.radius * 2, h = 16 },
+  })
+
+  local y = themes.menuPad + CLOSE.strip
   for index, row in ipairs(self.rows) do
     local h = rowHeight(row)
 
@@ -138,7 +160,11 @@ function Menu:render()
   end
 end
 
-function Menu:rowAt(y)
+function Menu:rowAt(y, x)
+  if x and x <= CLOSE.hit and y <= CLOSE.strip + 4 then
+    return "close"
+  end
+
   for index, row in ipairs(self.rows) do
     if row.kind ~= "sep" and row.kind ~= "header"
        and y >= row._y and y < (row._y + row._h) then
@@ -149,7 +175,7 @@ function Menu:rowAt(y)
 end
 
 local function measure(rows)
-  local height = themes.menuPad * 2
+  local height = themes.menuPad * 2 + CLOSE.strip
   for _, row in ipairs(rows) do height = height + rowHeight(row) end
   return height
 end
@@ -206,9 +232,9 @@ function Menu:show(rows, point)
   self:render()
 
   self.canvas:canvasMouseEvents(true, true, true, true)
-  self.canvas:mouseCallback(function(_, event, _, _, cy)
+  self.canvas:mouseCallback(function(_, event, _, cx, cy)
     if event == "mouseMove" or event == "mouseEnter" then
-      local index = self:rowAt(cy)
+      local index = self:rowAt(cy, cx)
       if index ~= self.hovered then
         self.hovered = index
         self:render()
@@ -221,7 +247,12 @@ function Menu:show(rows, point)
       end
 
     elseif event == "mouseUp" then
-      local index = self:rowAt(cy)
+      local index = self:rowAt(cy, cx)
+      if index == "close" then
+        self:hide()
+        return
+      end
+
       local row = index and self.rows[index]
       if not row then return end
 

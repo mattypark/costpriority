@@ -90,8 +90,12 @@ if let day = argument("--day") {
     dayStart = calendar.startOfDay(for: parsed)
 }
 
-guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
-    fail("bad-range", "could not compute the end of the day")
+// --days N widens the window past today, so the weekly and monthly views can
+// summarise a range without one request per day.
+let span = max(1, Int(argument("--days") ?? "1") ?? 1)
+
+guard let dayEnd = calendar.date(byAdding: .day, value: span, to: dayStart) else {
+    fail("bad-range", "could not compute the end of the range")
 }
 
 // ------------------------------------------------------------------- access
@@ -288,6 +292,14 @@ for event in events {
         "declined": declined || event.status == .canceled,
     ]
 
+    // The calendar's own colour, so the board can look like a calendar rather
+    // than a list. EKCalendar gives a CGColor; components are 0–1.
+    if let components = event.calendar?.cgColor?.components, components.count >= 3 {
+        item["color"] = [
+            Double(components[0]), Double(components[1]), Double(components[2]),
+        ]
+    }
+
     // All-day events carry meaningless clock times; the pet renders them as
     // "all day" and the ranker treats a nil start differently, so send nothing.
     if !event.isAllDay {
@@ -317,6 +329,7 @@ let writable = store.calendars(for: .event)
 
 write([
     "day": formatter.string(from: dayStart),
+    "days": span,
     "generated": Int(Date().timeIntervalSince1970),
     "count": payload.count,
     "events": payload,
