@@ -178,7 +178,33 @@ function Board:layout()
   }
   y = y + 20
 
-  if #calendar == 0 then
+  -- Weekly: a seven-column strip, read left to right like a week actually is.
+  if data.weekGrid then
+    rows[#rows + 1] = { kind = "weekGrid", grid = data.weekGrid, y = y, h = 62 }
+    y = y + 62 + 6
+  end
+
+  -- Weekly and monthly: what is actually worth knowing, routine stripped out.
+  if data.keyEvents then
+    if #data.keyEvents == 0 then
+      rows[#rows + 1] = {
+        kind = "empty", text = "Nothing out of the ordinary coming up.", y = y,
+        h = textHeight("Nothing out of the ordinary coming up.", themes.bodySize, innerW),
+      }
+      y = y + rows[#rows].h
+    else
+      rows[#rows + 1] = { kind = "sectionHeader", title = "WORTH KNOWING", y = y, h = 14 }
+      y = y + 18
+
+      for _, item in ipairs(data.keyEvents) do
+        local h = textHeight(item.title or "", themes.bodySize, innerW - 96) + 2
+        rows[#rows + 1] = { kind = "keyEvent", item = item, y = y, h = math.max(20, h) }
+        y = y + rows[#rows].h + 4
+      end
+      y = y - 4
+    end
+
+  elseif #calendar == 0 then
     rows[#rows + 1] = {
       kind = "empty", text = data.calendarEmpty or "Nothing scheduled.", y = y,
       h = textHeight(data.calendarEmpty or "Nothing scheduled.", themes.bodySize, innerW),
@@ -407,6 +433,80 @@ function Board:render()
         type = "text",
         text = styled(item.when or "", themes.smallSize, palette.dim),
         frame = { x = pad + 14, y = row.y + 5 + row.titleH, w = innerW - 22, h = 14 },
+      })
+
+    elseif row.kind == "weekGrid" then
+      local columns = #row.grid
+      local gap = 5
+      local colW = math.floor((innerW - gap * (columns - 1)) / columns)
+
+      for i, day in ipairs(row.grid) do
+        local cx = pad + (i - 1) * (colW + gap)
+
+        canvas:appendElements({
+          type = "rectangle",
+          action = "fill",
+          roundedRectRadii = { xRadius = 6, yRadius = 6 },
+          fillColor = day.today and palette.hover or { white = 0.5, alpha = 0.06 },
+          frame = { x = cx, y = row.y, w = colW, h = row.h },
+        })
+
+        canvas:appendElements({
+          type = "text",
+          text = styled(day.letter, themes.smallSize - 0.5, palette.dim, "center"),
+          frame = { x = cx, y = row.y + 5, w = colW, h = 14 },
+        })
+        canvas:appendElements({
+          type = "text",
+          text = styled(day.number, themes.bodySize + 1,
+                        day.today and palette.accent or palette.text, "center"),
+          frame = { x = cx, y = row.y + 17, w = colW, h = 16 },
+        })
+
+        -- One thin bar per event, in that calendar's colour: the column height
+        -- reads as "how full is this day" without any number being parsed.
+        for b, color in ipairs(day.colors) do
+          canvas:appendElements({
+            type = "rectangle",
+            action = "fill",
+            roundedRectRadii = { xRadius = 1, yRadius = 1 },
+            fillColor = { red = color[1], green = color[2], blue = color[3], alpha = 0.85 },
+            frame = { x = cx + 5, y = row.y + 36 + (b - 1) * 4, w = colW - 10, h = 2.5 },
+          })
+        end
+
+        canvas:appendElements({
+          type = "text",
+          text = styled(day.count > 0 and tostring(day.count) or "–",
+                        themes.smallSize - 1, palette.dim, "center"),
+          frame = { x = cx, y = row.y + row.h - 15, w = colW, h = 13 },
+        })
+      end
+
+    elseif row.kind == "keyEvent" then
+      local item = row.item
+      local base = item.color
+        and { red = item.color[1], green = item.color[2], blue = item.color[3] }
+        or palette.accent
+
+      canvas:appendElements({
+        type = "rectangle",
+        action = "fill",
+        roundedRectRadii = { xRadius = 2, yRadius = 2 },
+        fillColor = { red = base.red, green = base.green, blue = base.blue,
+                      alpha = item.state == "done" and 0.35 or 1 },
+        frame = { x = pad, y = row.y + 3, w = 3, h = row.h - 4 },
+      })
+      canvas:appendElements({
+        type = "text",
+        text = styled(item.title or "", themes.bodySize,
+                      item.state == "done" and palette.dim or palette.text, "left", true),
+        frame = { x = pad + 10, y = row.y, w = innerW - 96, h = row.h },
+      })
+      canvas:appendElements({
+        type = "text",
+        text = styled(item.when or "", themes.smallSize, palette.dim, "right"),
+        frame = { x = w - pad - 86, y = row.y + 1, w = 86, h = 14 },
       })
 
     elseif row.kind == "sectionHeader" then

@@ -111,36 +111,76 @@ local function compose()
     return (a.title or "") < (b.title or "")
   end)
 
-  -- Past today, listing every event is unreadable — a month of a repeating
-  -- morning routine is hundreds of rows saying nothing. Collapse to a count per
-  -- day instead, which is the thing you actually want to know at that range.
+  -- Past today, listing every event is unreadable and says nothing: a month of
+  -- a repeating morning routine is a hundred identical rows. Weekly becomes a
+  -- seven-column grid; monthly drops the per-day breakdown entirely and answers
+  -- the only questions that matter at that range — how much is on, and what is
+  -- actually worth knowing about.
   local calendarTitle = "TODAY'S CALENDAR"
+  local weekGrid, keyEvents
+
   if scope() ~= "daily" then
-    local perDay, order = {}, {}
+    -- Routine is whatever repeats. An event whose title recurs across the range
+    -- is a habit block, not news, so frequency alone separates signal from
+    -- scaffolding without asking a model anything.
+    local frequency = {}
     for _, event in ipairs(events) do
-      local key = os.date("%Y-%m-%d", event.start or now)
-      if not perDay[key] then
-        perDay[key] = { count = 0, label = os.date("%a %d %b", event.start or now) }
-        order[#order + 1] = key
-      end
-      perDay[key].count = perDay[key].count + 1
+      local title = event.title or ""
+      frequency[title] = (frequency[title] or 0) + 1
     end
-    table.sort(order)
+
+    keyEvents = {}
+    for _, event in ipairs(events) do
+      local title = event.title or ""
+      if (frequency[title] or 0) <= 2 and #keyEvents < 7 then
+        keyEvents[#keyEvents + 1] = {
+          title = title,
+          when = os.date("%a %d %b", event.start or now)
+                 .. (event.allDay and "" or os.date(" · %H:%M", event.start or now)),
+          color = event.color,
+          state = (event.start or now) < now and "done" or "ahead",
+          sortKey = event.start or now,
+        }
+      end
+    end
+    table.sort(keyEvents, function(a, b) return a.sortKey < b.sortKey end)
 
     calendarRows = {}
-    for _, key in ipairs(order) do
-      local day = perDay[key]
-      calendarRows[#calendarRows + 1] = {
-        title = day.label,
-        when = day.count .. (day.count == 1 and " event" or " events"),
-        state = (key < os.date("%Y-%m-%d")) and "done" or "ahead",
-        compact = true,
-      }
-    end
-    calendarTitle = (scope() == "weekly" and "NEXT 7 DAYS" or "NEXT 31 DAYS")
-      .. "  ·  " .. #events .. (#events == 1 and " event" or " events")
   end
 
+  if scope() == "weekly" then
+    local perDay = {}
+    for _, event in ipairs(events) do
+      local key = os.date("%Y-%m-%d", event.start or now)
+      perDay[key] = perDay[key] or { count = 0, colors = {} }
+      perDay[key].count = perDay[key].count + 1
+      if #perDay[key].colors < 5 and event.color then
+        perDay[key].colors[#perDay[key].colors + 1] = event.color
+      end
+    end
+
+    weekGrid = {}
+    local today = os.date("*t", now)
+    for offset = 0, 6 do
+      local when = os.time({
+        year = today.year, month = today.month, day = today.day + offset,
+        hour = 12,
+      })
+      local key = os.date("%Y-%m-%d", when)
+      local day = perDay[key] or { count = 0, colors = {} }
+      weekGrid[#weekGrid + 1] = {
+        letter = os.date("%a", when):sub(1, 1),
+        number = os.date("%d", when),
+        count = day.count,
+        colors = day.colors,
+        today = (offset == 0),
+      }
+    end
+    calendarTitle = "NEXT 7 DAYS  ·  " .. #events .. " events"
+
+  elseif scope() == "monthly" then
+    calendarTitle = "THIS MONTH  ·  " .. #events .. " events"
+  end
   local scopes = {}
   for _, id in ipairs(Priorities.scopes) do
     scopes[#scopes + 1] = {
@@ -175,6 +215,8 @@ local function compose()
     done = doneRows,
     calendar = calendarRows,
     calendarTitle = calendarTitle,
+    weekGrid = weekGrid,
+    keyEvents = keyEvents,
     calendarEmpty = (state.calendars and #state.calendars > 0)
       and "Nothing today on the calendars you picked."
       or "Nothing scheduled today.",
