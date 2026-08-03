@@ -11,6 +11,7 @@ local Pet        = require("cost.pet")
 local Board      = require("cost.board")
 local Menu       = require("cost.menu")
 local Priorities = require("cost.priorities")
+local Input      = require("cost.input")
 local Brain      = require("cost.brain")
 local Calendar   = require("cost.sources.calendar")
 local themes     = require("cost.themes")
@@ -19,8 +20,10 @@ local M = {}
 
 local HOTKEY = { { "ctrl", "alt", "cmd" }, "i" }
 local HOTKEY_HINT = "⌃⌥⌘I"
+local ASK_HOTKEY = { { "ctrl", "alt", "cmd" }, "k" }
+local ASK_HINT = "⌃⌥⌘K"
 
-local state, pet, board, menu, menubar, hotkey, waker
+local state, pet, board, menu, menubar, hotkey, askHotkey, waker
 local lists                    -- the three priority lists
 local events = {}              -- today's calendar, for context
 local calendarNote             -- why the calendar is missing, when it is
@@ -228,26 +231,26 @@ end
 
 -- --------------------------------------------------------------------- input
 
---- Ask for text. A native prompt for now — the themed input bar replaces this,
---- and is the thing that makes dictation work.
-local function ask(title, message)
-  local button, text = hs.dialog.textPrompt(title, message, "", "Add", "Cancel")
-  if button ~= "Add" then return nil end
-  return text
-end
-
+--- Open the input bar next to the pet.
+---
+--- It's a real text field, so your macOS dictation shortcut works in it — set
+--- one under System Settings › Keyboard › Dictation and you can talk instead of
+--- type, with no permission granted to Hammerspoon at all.
 function M.promptAdd(targetScope)
   targetScope = targetScope or scope()
-  local text = ask("Add to your " .. Priorities.label[targetScope]:lower() .. " list",
-                   "One priority. You can add more after.")
-  if not text or text == "" then return end
 
-  M.addPriority(text, targetScope)
+  Input.show({
+    anchor = pet:frame(),
+    hint = "ADD TO " .. string.upper(Priorities.label[targetScope]),
+    placeholder = "what matters?",
+  }, function(text)
+    M.addPriority(text, targetScope)
 
-  if not board:isOpen() then
-    board:setAnchor(pet:frame())
-    board:show(compose())
-  end
+    if not board:isOpen() then
+      board:setAnchor(pet:frame())
+      board:show(compose())
+    end
+  end)
 end
 
 -- --------------------------------------------------------------------- menu
@@ -369,7 +372,7 @@ function actions()
 
   rows[#rows + 1] = {
     title = "Add a priority…",
-    hint = Priorities.label[scope()],
+    hint = ASK_HINT,
     fn = function() M.promptAdd() end,
   }
   rows[#rows + 1] = {
@@ -570,6 +573,7 @@ local function start()
   end
 
   hotkey = hs.hotkey.bind(HOTKEY[1], HOTKEY[2], function() M.toggle() end)
+  askHotkey = hs.hotkey.bind(ASK_HOTKEY[1], ASK_HOTKEY[2], function() M.promptAdd() end)
 
   -- The calendar refreshes on its own because it is free and local. Claude
   -- never does — that only happens when asked.
@@ -611,6 +615,8 @@ local function start()
       if pet then pet:delete(); pet = nil end
       if menubar then menubar:delete(); menubar = nil end
       if hotkey then hotkey:delete(); hotkey = nil end
+      if askHotkey then askHotkey:delete(); askHotkey = nil end
+      if Input then Input.hide() end
       if waker then waker:stop(); waker = nil end
     end,
   }
