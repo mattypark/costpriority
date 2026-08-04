@@ -17,11 +17,14 @@ local defaults = {
   -- default: a fresh install should show your day, not nothing.
   calendars = {},
   model     = "",        -- empty = whatever `claude` defaults to
+  reminders = true,      -- nudge before something starts
+  leads     = { 30, 10, 3 },   -- minutes before, coarsest first
+  smartNudges = true,    -- let Claude write the wording; timing never depends on it
 }
 
 local KEYS = {
   "x", "y", "hidden", "theme", "petWidth", "boardOpen", "scope", "calendars",
-  "model", "configured",
+  "model", "reminders", "leads", "smartNudges", "configured",
 }
 
 local State = {}

@@ -19,6 +19,7 @@ local CLAUDE = os.getenv("HOME") .. "/.local/bin/claude"
 local PROMPT_FILE = hs.configdir .. "/cost/prompt.md"
 local PRIORITIES_PROMPT = hs.configdir .. "/cost/prompt-priorities.md"
 local INTENT_PROMPT = hs.configdir .. "/cost/prompt-intent.md"
+local NUDGE_PROMPT = hs.configdir .. "/cost/prompt-nudge.md"
 -- Generous, because it covers the CLI's cold start as well as the request.
 local TIMEOUT = 90
 local MAX_EVENTS = 40      -- a pathological calendar shouldn't blow up the prompt
@@ -368,6 +369,56 @@ function Brain.parseIntent(text, events, calendars, defaultCalendar, opts, callb
   local input = Intent.payload(text, events, calendars, defaultCalendar)
 
   run(prompt, input, opts, function(raw) return raw end, callback)
+end
+
+--- One short line to show just before an event starts.
+---
+--- Deliberately small and cheap: it runs unattended, several times a day, so it
+--- gets the least context that can still produce a useful sentence.
+function Brain.nudge(event, events, items, opts, callback)
+  opts = opts or {}
+
+  local prompt = loadPrompt(NUDGE_PROMPT)
+  if not prompt then return callback(nil, "prompt-nudge.md is missing") end
+  if not event then return callback(nil, "no event") end
+
+  local rest = {}
+  for _, other in ipairs(events or {}) do
+    if other.uid ~= event.uid and other.start and other.start >= os.time()
+       and #rest < 6 then
+      rest[#rest + 1] = { title = other.title, start = other.start }
+    end
+  end
+
+  local priorities = {}
+  for _, item in ipairs(items or {}) do
+    if not item.done and #priorities < 8 then
+      priorities[#priorities + 1] = item.text
+    end
+  end
+
+  local input = hs.json.encode({
+    now = os.time(),
+    now_local = os.date("%Y-%m-%d %H:%M"),
+    event = {
+      title = event.title,
+      start = event.start,
+      endTime = event.endTime,
+      attendees = event.attendees or 0,
+      calendar = event.calendar,
+      location = event.location,
+      notes = event.notes,
+    },
+    later_today = rest,
+    priorities = priorities,
+  })
+
+  run(prompt, input, opts, function(raw)
+    if type(raw) ~= "table" then return nil, "not an object" end
+    local line = clean(raw.line, 90)
+    if not line then return nil, "no line" end
+    return { line = line }
+  end, callback)
 end
 
 --- Rank the user's own list, with the calendar as context.

@@ -15,6 +15,7 @@ local Input      = require("cost.input")
 local Bubble     = require("cost.bubble")
 local Intent     = require("cost.intent")
 local Brain      = require("cost.brain")
+local Reminders  = require("cost.reminders")
 local Calendar   = require("cost.sources.calendar")
 local themes     = require("cost.themes")
 
@@ -26,6 +27,7 @@ local ASK_HOTKEY = { { "ctrl", "alt", "cmd" }, "k" }
 local ASK_HINT = "⌃⌥⌘K"
 
 local state, pet, board, menu, menubar, hotkey, askHotkey, waker, bubble
+local calendarTimer
 local lists                    -- the three priority lists
 local events = {}              -- today's calendar, for context
 local calendarNote             -- why the calendar is missing, when it is
@@ -495,6 +497,86 @@ function M.talk()
   end)
 end
 
+-- ---------------------------------------------------------------- reminders
+
+--- Show a nudge. Bubble beside the pet, a hop, a sound, and a system
+--- notification — because the pet may be hidden, on another Space, or behind a
+--- full-screen window, and a reminder you didn't see is not a reminder.
+local function nudge(event, lead)
+  local text = Reminders.text(event, lead)
+
+  if pet and not pet:isHidden() then
+    pet:nudge()
+    bubble:setAnchor(pet:frame())
+  end
+
+  bubble:say(text, {
+    title = event.title,
+    actions = {
+      { title = "Got it", fn = function() end },
+    },
+  })
+
+  hs.sound.getByName("Submarine"):play()
+
+  local notification = hs.notify.new({
+    title = event.title or "Coming up",
+    subTitle = lead <= 0 and "starting now" or ("in " .. lead .. " minutes"),
+    informativeText = text,
+    withdrawAfter = 0,
+  })
+  if notification then notification:send() end
+end
+
+--- Fire a reminder, asking Claude for the wording first when there's time.
+---
+--- The 3-minute nudge never waits on the model: at that range a late-but-clever
+--- line is worse than an instant plain one. Longer leads have room, and the
+--- wording is cached per event so the later nudges reuse it for free.
+--- Is this worth spending a model call on?
+---
+--- A nudge costs about three cents, and most of a day is routine: "Wake up,
+--- showering" needs no wording help and asking for some is money burnt several
+--- times a day. Something is worth it if it has other people in it, a place, a
+--- link, or is simply not a thing that repeats.
+local function worthWording(event)
+  if (event.attendees or 0) >= 1 then return true end
+  if event.location and event.location ~= "" then return true end
+  if event.notes and event.notes ~= "" then return true end
+
+  local repeats = 0
+  for _, other in ipairs(events) do
+    if other.title == event.title then repeats = repeats + 1 end
+  end
+  return repeats <= 1
+end
+
+local function fireReminder(event, lead)
+  local urgent = lead <= 3
+
+  if urgent or not Brain.available() or not state.smartNudges
+     or Reminders.hasLine(event.uid) or not worthWording(event) then
+    nudge(event, lead)
+    return
+  end
+
+  nudge(event, lead)   -- show the plain line immediately, upgrade it after
+
+  Brain.nudge(event, events, lists[scope()], { model = state.model },
+    function(result)
+      if result and result.line then
+        Reminders.remember(event.uid, result.line)
+        -- Only rewrite the bubble if it is still the one we just put up.
+        if bubble:isOpen() then
+          bubble:say(Reminders.text(event, lead), {
+            title = event.title,
+            actions = { { title = "Got it", fn = function() end } },
+          })
+        end
+      end
+    end)
+end
+
 -- --------------------------------------------------------------------- menu
 
 local actions
@@ -590,6 +672,66 @@ local function itemPage(item)
 end
 
 --- Which calendars cost reads. Nothing selected means all of them.
+local LEAD_SETS = {
+  { label = "30 · 10 · 3 min", leads = { 30, 10, 3 } },
+  { label = "15 · 5 min",      leads = { 15, 5 } },
+  { label = "10 · 2 min",      leads = { 10, 2 } },
+  { label = "5 min only",      leads = { 5 } },
+  { label = "1 hour · 15 · 5", leads = { 60, 15, 5 } },
+}
+
+local function remindersPage()
+  local rows = { { kind = "header", title = "REMIND ME BEFORE" } }
+
+  local on = state.reminders ~= false
+  rows[#rows + 1] = {
+    title = (on and "◉ " or "○ ") .. (on and "Reminders on" or "Reminders off"),
+    keepOpen = true,
+    rebuild = function() return remindersPage() end,
+    fn = function()
+      state.reminders = not on
+      State.save(state)
+      -- Clearing what has already fired lets a re-enable catch anything that is
+      -- already inside a window, rather than staying silent until the next one.
+      if state.reminders then Reminders.reset() end
+    end,
+  }
+
+  rows[#rows + 1] = { kind = "sep" }
+
+  local current = table.concat(state.leads or Reminders.defaultLeads, ",")
+  for _, set in ipairs(LEAD_SETS) do
+    local active = (table.concat(set.leads, ",") == current)
+    rows[#rows + 1] = {
+      title = (active and "● " or "   ") .. set.label,
+      keepOpen = true,
+      rebuild = function() return remindersPage() end,
+      fn = function()
+        state.leads = set.leads
+        State.save(state)
+        Reminders.reset()
+      end,
+    }
+  end
+
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = {
+    title = (state.smartNudges and "☑ " or "☐ ") .. "Let Claude word them",
+    preview = state.smartNudges and "~$0.005 each · timing never waits on it"
+                                or "plain \"X starts in 10 minutes\"",
+    keepOpen = true,
+    rebuild = function() return remindersPage() end,
+    fn = function()
+      state.smartNudges = not state.smartNudges
+      State.save(state)
+    end,
+  }
+
+  rows[#rows + 1] = { kind = "sep" }
+  rows[#rows + 1] = { title = "← Back", submenu = function() return actions() end }
+  return rows
+end
+
 local function calendarsPage()
   local chosen = {}
   local count = 0
@@ -733,6 +875,13 @@ function actions()
     hint = "▸ " .. ((state.calendars and #state.calendars > 0)
                     and (#state.calendars .. " chosen") or "all"),
     submenu = calendarsPage,
+  }
+  rows[#rows + 1] = {
+    title = "Reminders",
+    hint = "▸ " .. ((state.reminders ~= false)
+             and table.concat(state.leads or Reminders.defaultLeads, "·") .. " min"
+             or "off"),
+    submenu = remindersPage,
   }
   rows[#rows + 1] = { title = "Appearance", hint = "▸ " .. themes.label(), submenu = appearancePage }
 
@@ -901,6 +1050,19 @@ local function start()
   -- never does — that only happens when asked.
   M.refreshCalendar()
 
+  -- Watch for what is about to start. Deterministic, local, and free — no
+  -- model is involved in deciding when this fires.
+  Reminders.start({
+    events = function() return events end,
+    leads = function() return state.leads or Reminders.defaultLeads end,
+    enabled = function() return state.reminders ~= false end,
+    onFire = fireReminder,
+  })
+
+  -- The calendar has to stay current or reminders fire against a stale day.
+  -- Reading it is local and costs nothing, unlike ranking.
+  calendarTimer = hs.timer.doEvery(300, function() M.refreshCalendar() end)
+
   waker = hs.caffeinate.watcher.new(function(event)
     if event == hs.caffeinate.watcher.systemDidWake
        or event == hs.caffeinate.watcher.screensDidUnlock then
@@ -942,6 +1104,8 @@ local function start()
       if askHotkey then askHotkey:delete(); askHotkey = nil end
       if Input then Input.hide() end
       if waker then waker:stop(); waker = nil end
+      if calendarTimer then calendarTimer:stop(); calendarTimer = nil end
+      Reminders.stop()
     end,
   }
 end
